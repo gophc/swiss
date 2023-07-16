@@ -17,7 +17,7 @@ const (
 
 type bitset8 uint64
 
-func metaMatchH8(m *metadata8, h h2E8) bitset8 {
+func metaMatchH2E8(m *metadata8, h h2E8) bitset8 {
 	// https://graphics.stanford.edu/~seander/bithacks.html##ValueInWord
 	return hasZeroByte8(*(*uint64)((unsafe.Pointer)(m)) ^ (loBits8 * uint64(h)))
 }
@@ -101,7 +101,7 @@ func (m *Map8[K, V]) Has(key K) (ok bool) {
 	hi, lo := splitHash8(m.hash.Hash(key))
 	g := probeStart8(hi, len(m.groups))
 	for { // inlined find loop
-		matches := metaMatchH8(&m.ctrl[g], lo)
+		matches := metaMatchH2E8(&m.ctrl[g], lo)
 		for matches != 0 {
 			s := nextMatch8(&matches)
 			if key == m.groups[g].keys[s] {
@@ -128,7 +128,7 @@ func (m *Map8[K, V]) Get(key K) (value V, ok bool) {
 	hi, lo := splitHash8(m.hash.Hash(key))
 	g := probeStart8(hi, len(m.groups))
 	for { // inlined find loop
-		matches := metaMatchH8(&m.ctrl[g], lo)
+		matches := metaMatchH2E8(&m.ctrl[g], lo)
 		for matches != 0 {
 			s := nextMatch8(&matches)
 			if key == m.groups[g].keys[s] {
@@ -158,7 +158,7 @@ func (m *Map8[K, V]) Put(key K, value V) {
 	hi, lo := splitHash8(m.hash.Hash(key))
 	g := probeStart8(hi, len(m.groups))
 	for { // inlined find loop
-		matches := metaMatchH8(&m.ctrl[g], lo)
+		matches := metaMatchH2E8(&m.ctrl[g], lo)
 		for matches != 0 {
 			s := nextMatch8(&matches)
 			if key == m.groups[g].keys[s] { // update
@@ -190,7 +190,7 @@ func (m *Map8[K, V]) Delete(key K) (ok bool) {
 	hi, lo := splitHash8(m.hash.Hash(key))
 	g := probeStart8(hi, len(m.groups))
 	for {
-		matches := metaMatchH8(&m.ctrl[g], lo)
+		matches := metaMatchH2E8(&m.ctrl[g], lo)
 		for matches != 0 {
 			s := nextMatch8(&matches)
 			if key == m.groups[g].keys[s] {
@@ -280,7 +280,7 @@ func (m *Map8[K, V]) Capacity() int {
 func (m *Map8[K, V]) find(key K, hi h1E8, lo h2E8) (g, s uint32, ok bool) {
 	g = probeStart8(hi, len(m.groups))
 	for {
-		matches := metaMatchH8(&m.ctrl[g], lo)
+		matches := metaMatchH2E8(&m.ctrl[g], lo)
 		for matches != 0 {
 			s = nextMatch8(&matches)
 			if key == m.groups[g].keys[s] {
