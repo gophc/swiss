@@ -36,34 +36,44 @@ const (
 type SwissMap[K comparable, V any] struct {
 	flags uintptr
 	hash  Hasher[K]
-	SwissSubMap[K, V]
+	SwissSub[K, V]
 }
 
-type SwissLargeMap[K comparable, V any] struct {
+type SwissLarge[K comparable, V any] struct {
 	flags uintptr
 	hash  Hasher[K]
-	subs  [splitSubMapSize]SwissSubMap[K, V]
+	subs  [splitSubMapSize]SwissSub[K, V]
 }
 
-type SwissSubMap[K comparable, V any] struct {
-	ctrl     []swissMetadata
+type SwissSub[K comparable, V any] struct {
+	ctrl     *uint64
 	groups   []swissGroup[K, V]
 	resident uint32
 	dead     uint32
 	limit    uint32
-	unused   uint32
+}
+
+type swissGroup[K comparable, V any] struct {
+	keys   [swissGroupSize]K
+	values [swissGroupSize]V
+}
+
+type SwissSlice struct {
+	Ptr unsafe.Pointer
+	Len int
+	Cap int
+}
+
+type SwissUint64Slice struct {
+	Ptr *uint64
+	Len int
+	Cap int
 }
 
 // swissMetadata is the swissH2 swissMetadata array for a swissGroup.
 // find operations first probe the controls bytes
 // to filter candidates before matching keys
 type swissMetadata [swissGroupSize]int8
-
-// swissGroup is a swissGroup of 16 key-value pairs
-type swissGroup[K comparable, V any] struct {
-	keys   [swissGroupSize]K
-	values [swissGroupSize]V
-}
 
 // swissH1 is a 57 bit hash prefix
 type swissH1 uint64
@@ -76,114 +86,151 @@ type swissH2 int8
 //goland:noinspection GoUnusedExportedFunction
 func NewSwissMap[K comparable, V any](sz uint32) *SwissMap[K, V] {
 	var (
-		m *SwissMap[K, V]
+		groupn uint32
+		groupm uint32
+		m      *SwissMap[K, V]
+		ctrl   []uint64
 	)
-	groups := swissNumGroups(sz)
-	if groups*swissGroupSize > splitSubMapLimit {
-		lm := &SwissLargeMap[K, V]{
+
+	if sz >= splitSubMapLimit {
+		lm := &SwissLarge[K, V]{
 			flags: flagLargeMap,
 			hash:  NewHasher[K](),
 		}
-		groups = groups / splitSubMapSize
+		groupn = swissNumGroups(sz >> 8) // swissNumGroups(sz / splitSubMapSize)
 		for sdx := uint32(0); sdx < splitSubMapSize; sdx++ {
-			lm.subs[sdx].ctrl = make([]swissMetadata, groups)
-			lm.subs[sdx].groups = make([]swissGroup[K, V], groups)
-			lm.subs[sdx].limit = groups * swissMaxAvgGroupLoad
-
-			t64 := (*[]uint64)(unsafe.Pointer(&lm.subs[sdx].ctrl))
-			for i := range *t64 {
-				(*t64)[i] = swissEmpty64
+			ctrl = make([]uint64, groupn)
+			lm.subs[sdx].ctrl = (*SwissUint64Slice)(unsafe.Pointer(&ctrl)).Ptr
+			groupm = groupn << 3
+			lm.subs[sdx].groups = make([]swissGroup[K, V], groupn)
+			lm.subs[sdx].limit = groupm - groupn // groups * swissMaxAvgGroupLoad
+			for i := uintptr(0); i < uintptr(groupm); i += 8 {
+				*(*uint64)(unsafe.Pointer(uintptr(unsafe.Pointer(lm.subs[sdx].ctrl)) + i)) = swissEmpty64
 			}
 		}
 		m = (*SwissMap[K, V])(unsafe.Pointer(lm))
 	} else {
+		groupn = swissNumGroups(sz)
+		ctrl = make([]uint64, groupn)
+		groupm = groupn << 3
 		m = &SwissMap[K, V]{
 			flags: flagSmallMap,
 			hash:  NewHasher[K](),
-			SwissSubMap: SwissSubMap[K, V]{
-				ctrl:   make([]swissMetadata, groups),
-				groups: make([]swissGroup[K, V], groups),
-				limit:  groups * swissMaxAvgGroupLoad,
+			SwissSub: SwissSub[K, V]{
+				ctrl:   (*SwissUint64Slice)(unsafe.Pointer(&ctrl)).Ptr,
+				groups: make([]swissGroup[K, V], groupn),
+				limit:  groupm - groupn,
 			},
 		}
 
-		t64 := (*[]uint64)(unsafe.Pointer(&m.ctrl))
-		for i := range *t64 {
-			(*t64)[i] = swissEmpty64
+		for i := uintptr(0); i < uintptr(groupm); i += 8 {
+			*(*uint64)(unsafe.Pointer(uintptr(unsafe.Pointer(m.ctrl)) + i)) = swissEmpty64
 		}
 	}
 	return m
 }
 
+//go:nosplit
+func _u64(p *uint64, x uint32) *uint64 {
+	return (*uint64)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + uintptr(x<<3)))
+}
+
+func _i8(p *uint64, x uint32) *int8 {
+	return (*int8)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + uintptr(x)))
+}
+
 // Has returns true if |key| is present in |m|.
-func (m *SwissMap[K, V]) Has(key K) (ok bool) {
+func (m *SwissMap[K, V]) Has(key K) bool {
+	var (
+		lm      *SwissLarge[K, V]
+		meta    *uint64
+		matches uint64
+		size    uint32
+		g       uint32
+		s       uint32
+		sdx     uint8
+	)
 	hi, lo := swissSplitHash(m.hash.Hash64(key))
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
-		sdx := uint8(hi)
+		lm = (*SwissLarge[K, V])(unsafe.Pointer(m))
+		sdx = uint8(hi)
 
-		g := swissProbeStart(hi, len(lm.subs[sdx].groups))
+		size = uint32(len(lm.subs[sdx].groups))
+		g = swissProbeStart(hi, size)
 		for { // inlined find loop
-			matches := swissMetaMatchH2(&lm.subs[sdx].ctrl[g], lo)
+			meta = _u64(lm.subs[sdx].ctrl, g)
+			matches = swissMetaMatchH2(meta, lo)
 			for matches != 0 {
-				s := swissNextMatch(&matches)
+				s = swissNextMatch(&matches)
 				if key == lm.subs[sdx].groups[g].keys[s] {
-					ok = true
-					return
+					return true
 				}
 			}
 			// |key| is not in swissGroup |g|,
 			// stop probing if we see an swissEmpty slot
-			matches = swissMetaMatchEmpty(&lm.subs[sdx].ctrl[g])
+			matches = swissMetaMatchEmpty(meta)
 			if matches != 0 {
-				ok = false
-				return
+				return false
 			}
 			g += 1 // linear probing
-			if g >= uint32(len(lm.subs[sdx].groups)) {
+			if g >= size {
 				g = 0
 			}
 		}
 		//goland:noinspection GoUnreachableCode
-		return
+		return false
 	}
 
-	g := swissProbeStart(hi, len(m.groups))
+	size = uint32(len(m.groups))
+	g = swissProbeStart(hi, size)
 	for { // inlined find loop
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
+		meta = _u64(m.ctrl, g)
+		matches = swissMetaMatchH2(meta, lo)
 		for matches != 0 {
-			s := swissNextMatch(&matches)
+			s = swissNextMatch(&matches)
 			if key == m.groups[g].keys[s] {
-				ok = true
-				return
+				return true
 			}
 		}
 		// |key| is not in swissGroup |g|,
 		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
+		matches = swissMetaMatchEmpty(meta)
 		if matches != 0 {
-			ok = false
-			return
+			return false
 		}
 		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
+		if g >= size {
 			g = 0
 		}
 	}
+
+	//goland:noinspection GoUnreachableCode
+	return false
 }
 
 // Get returns the |value| mapped by |key| if one exists.
 func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
+	var (
+		lm      *SwissLarge[K, V]
+		meta    *uint64
+		matches uint64
+		size    uint32
+		g       uint32
+		s       uint32
+		sdx     uint8
+	)
 	hi, lo := swissSplitHash(m.hash.Hash64(key))
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
-		sdx := uint8(hi)
+		lm = (*SwissLarge[K, V])(unsafe.Pointer(m))
+		sdx = uint8(hi)
 
-		g := swissProbeStart(hi, len(lm.subs[sdx].groups))
+		size = uint32(len(lm.subs[sdx].groups))
+		g = swissProbeStart(hi, size)
 		for { // inlined find loop
-			matches := swissMetaMatchH2(&lm.subs[sdx].ctrl[g], lo)
+			meta = _u64(lm.subs[sdx].ctrl, g)
+			matches = swissMetaMatchH2(meta, lo)
 			for matches != 0 {
-				s := swissNextMatch(&matches)
+				s = swissNextMatch(&matches)
 				if key == lm.subs[sdx].groups[g].keys[s] {
 					value, ok = lm.subs[sdx].groups[g].values[s], true
 					return
@@ -191,13 +238,13 @@ func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
 			}
 			// |key| is not in swissGroup |g|,
 			// stop probing if we see an swissEmpty slot
-			matches = swissMetaMatchEmpty(&lm.subs[sdx].ctrl[g])
+			matches = swissMetaMatchEmpty(meta)
 			if matches != 0 {
 				ok = false
 				return
 			}
 			g += 1 // linear probing
-			if g >= uint32(len(lm.subs[sdx].groups)) {
+			if g >= size {
 				g = 0
 			}
 		}
@@ -205,11 +252,13 @@ func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
 		return
 	}
 
-	g := swissProbeStart(hi, len(m.groups))
+	size = uint32(len(m.groups))
+	g = swissProbeStart(hi, size)
 	for { // inlined find loop
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
+		meta = _u64(m.ctrl, g)
+		matches = swissMetaMatchH2(meta, lo)
 		for matches != 0 {
-			s := swissNextMatch(&matches)
+			s = swissNextMatch(&matches)
 			if key == m.groups[g].keys[s] {
 				value, ok = m.groups[g].values[s], true
 				return
@@ -217,13 +266,13 @@ func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
 		}
 		// |key| is not in swissGroup |g|,
 		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
+		matches = swissMetaMatchEmpty(meta)
 		if matches != 0 {
 			ok = false
 			return
 		}
 		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
+		if g >= size {
 			g = 0
 		}
 	}
@@ -231,19 +280,30 @@ func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
 
 // Put attempts to insert |key| and |value|
 func (m *SwissMap[K, V]) Put(key K, value V) {
+	var (
+		lm      *SwissLarge[K, V]
+		meta    *uint64
+		matches uint64
+		size    uint32
+		g       uint32
+		s       uint32
+		sdx     uint8
+	)
 	hi, lo := swissSplitHash(m.hash.Hash64(key))
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
-		sdx := uint8(hi)
+		lm = (*SwissLarge[K, V])(unsafe.Pointer(m))
+		sdx = uint8(hi)
 		if lm.subs[sdx].resident >= lm.subs[sdx].limit {
 			m.subRehash(sdx, m.subNextSize(sdx))
 		}
 
-		g := swissProbeStart(hi, len(lm.subs[sdx].groups))
+		size = uint32(len(lm.subs[sdx].groups))
+		g = swissProbeStart(hi, size)
 		for { // inlined find loop
-			matches := swissMetaMatchH2(&lm.subs[sdx].ctrl[g], lo)
+			meta = _u64(lm.subs[sdx].ctrl, g)
+			matches = swissMetaMatchH2(meta, lo)
 			for matches != 0 {
-				s := swissNextMatch(&matches)
+				s = swissNextMatch(&matches)
 				if key == lm.subs[sdx].groups[g].keys[s] { // update
 					lm.subs[sdx].groups[g].keys[s] = key
 					lm.subs[sdx].groups[g].values[s] = value
@@ -252,17 +312,19 @@ func (m *SwissMap[K, V]) Put(key K, value V) {
 			}
 			// |key| is not in swissGroup |g|,
 			// stop probing if we see an swissEmpty slot
-			matches = swissMetaMatchEmpty(&lm.subs[sdx].ctrl[g])
+			matches = swissMetaMatchEmpty(meta)
 			if matches != 0 { // insert
-				s := swissNextMatch(&matches)
+				s = swissNextMatch(&matches)
+
 				lm.subs[sdx].groups[g].keys[s] = key
 				lm.subs[sdx].groups[g].values[s] = value
-				lm.subs[sdx].ctrl[g][s] = int8(lo)
+
+				*_i8(meta, s) = int8(lo) // lm.subs[sdx].ctrl[g][s]
 				lm.subs[sdx].resident++
 				return
 			}
 			g += 1 // linear probing
-			if g >= uint32(len(lm.subs[sdx].groups)) {
+			if g >= size {
 				g = 0
 			}
 		}
@@ -274,11 +336,13 @@ func (m *SwissMap[K, V]) Put(key K, value V) {
 		m.rehash(m.nextSize())
 	}
 
-	g := swissProbeStart(hi, len(m.groups))
+	size = uint32(len(m.groups))
+	g = swissProbeStart(hi, size)
 	for { // inlined find loop
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
+		meta = _u64(m.ctrl, g)
+		matches = swissMetaMatchH2(meta, lo)
 		for matches != 0 {
-			s := swissNextMatch(&matches)
+			s = swissNextMatch(&matches)
 			if key == m.groups[g].keys[s] { // update
 				m.groups[g].keys[s] = key
 				m.groups[g].values[s] = value
@@ -287,36 +351,48 @@ func (m *SwissMap[K, V]) Put(key K, value V) {
 		}
 		// |key| is not in swissGroup |g|,
 		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
+		matches = swissMetaMatchEmpty(meta)
 		if matches != 0 { // insert
-			s := swissNextMatch(&matches)
+			s = swissNextMatch(&matches)
+
 			m.groups[g].keys[s] = key
 			m.groups[g].values[s] = value
-			m.ctrl[g][s] = int8(lo)
+
+			*_i8(meta, s) = int8(lo) //  m.ctrl[g][s]
 			m.resident++
 			return
 		}
 		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
+		if g >= size {
 			g = 0
 		}
 	}
 }
 
 // Delete attempts to remove |key|, returns true successful.
-func (m *SwissMap[K, V]) Delete(key K) (ok bool) {
+func (m *SwissMap[K, V]) Delete(key K) bool {
+	var (
+		lm      *SwissLarge[K, V]
+		meta    *uint64
+		matches uint64
+		size    uint32
+		g       uint32
+		s       uint32
+		sdx     uint8
+	)
 	hi, lo := swissSplitHash(m.hash.Hash64(key))
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
-		sdx := uint8(hi)
+		lm = (*SwissLarge[K, V])(unsafe.Pointer(m))
+		sdx = uint8(hi)
 
-		g := swissProbeStart(hi, len(lm.subs[sdx].groups))
+		size = uint32(len(lm.subs[sdx].groups))
+		g = swissProbeStart(hi, size)
 		for {
-			matches := swissMetaMatchH2(&lm.subs[sdx].ctrl[g], lo)
+			meta = _u64(lm.subs[sdx].ctrl, g)
+			matches = swissMetaMatchH2(meta, lo)
 			for matches != 0 {
-				s := swissNextMatch(&matches)
+				s = swissNextMatch(&matches)
 				if key == lm.subs[sdx].groups[g].keys[s] {
-					ok = true
 					// optimization: if |m.ctrl[g]| contains any swissEmpty
 					// swissMetadata bytes, we can physically delete |key|
 					// rather than placing a swissTombstone.
@@ -324,39 +400,39 @@ func (m *SwissMap[K, V]) Delete(key K) (ok bool) {
 					// would already be terminated by the existing swissEmpty
 					// slot, and therefore reclaiming slot |s| will not
 					// cause premature termination of probes into |g|.
-					if swissMetaMatchEmpty(&lm.subs[sdx].ctrl[g]) != 0 {
-						lm.subs[sdx].ctrl[g][s] = swissEmpty
+					if swissMetaMatchEmpty(meta) != 0 {
+						*_i8(meta, s) = swissEmpty // lm.subs[sdx].ctrl[g][s]
 						lm.subs[sdx].resident--
 					} else {
-						lm.subs[sdx].ctrl[g][s] = swissTombstone
+						*_i8(meta, s) = swissTombstone // lm.subs[sdx].ctrl[g][s]
 						lm.subs[sdx].dead++
 					}
-					return
+					return true
 				}
 			}
 			// |key| is not in swissGroup |g|,
 			// stop probing if we see an swissEmpty slot
-			matches = swissMetaMatchEmpty(&lm.subs[sdx].ctrl[g])
+			matches = swissMetaMatchEmpty(meta)
 			if matches != 0 { // |key| absent
-				ok = false
-				return
+				return false
 			}
 			g += 1 // linear probing
-			if g >= uint32(len(lm.subs[sdx].groups)) {
+			if g >= size {
 				g = 0
 			}
 		}
 		//goland:noinspection GoUnreachableCode
-		return
+		return false
 	}
 
-	g := swissProbeStart(hi, len(m.groups))
+	size = uint32(len(m.groups))
+	g = swissProbeStart(hi, size)
 	for {
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
+		meta = _u64(m.ctrl, g)
+		matches = swissMetaMatchH2(meta, lo)
 		for matches != 0 {
-			s := swissNextMatch(&matches)
+			s = swissNextMatch(&matches)
 			if key == m.groups[g].keys[s] {
-				ok = true
 				// optimization: if |m.ctrl[g]| contains any swissEmpty
 				// swissMetadata bytes, we can physically delete |key|
 				// rather than placing a swissTombstone.
@@ -364,25 +440,24 @@ func (m *SwissMap[K, V]) Delete(key K) (ok bool) {
 				// would already be terminated by the existing swissEmpty
 				// slot, and therefore reclaiming slot |s| will not
 				// cause premature termination of probes into |g|.
-				if swissMetaMatchEmpty(&m.ctrl[g]) != 0 {
-					m.ctrl[g][s] = swissEmpty
+				if swissMetaMatchEmpty(meta) != 0 {
+					*_i8(meta, s) = swissEmpty // m.ctrl[g][s]
 					m.resident--
 				} else {
-					m.ctrl[g][s] = swissTombstone
+					*_i8(meta, s) = swissTombstone // m.ctrl[g][s]
 					m.dead++
 				}
-				return
+				return true
 			}
 		}
 		// |key| is not in swissGroup |g|,
 		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
+		matches = swissMetaMatchEmpty(meta)
 		if matches != 0 { // |key| absent
-			ok = false
-			return
+			return false
 		}
 		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
+		if g >= size {
 			g = 0
 		}
 	}
@@ -394,16 +469,23 @@ func (m *SwissMap[K, V]) Delete(key K) (ok bool) {
 // Mutated during iteration, mutations will be reflected on return from
 // Iter, but the set of keys visited by Iter is non-deterministic.
 func (m *SwissMap[K, V]) Iter(cb func(k K, v V) (stop bool)) {
+	var (
+		lm     *SwissLarge[K, V]
+		meta   *swissMetadata
+		size   uint32
+		sdx    uint32
+		ctrl   *uint64
+		groups []swissGroup[K, V]
+	)
 	// take a consistent view of the table in case
 	// we rehash during iteration
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
-		for sdx := uint32(0); sdx < splitSubMapSize; sdx++ {
-			ctrl, groups := lm.subs[sdx].ctrl, lm.subs[sdx].groups
-			// pick a random starting swissGroup
-			g := swissRandIntN(len(groups))
-			for n := 0; n < len(groups); n++ {
-				for s, c := range ctrl[g] {
+		lm = (*SwissLarge[K, V])(unsafe.Pointer(m))
+		for sdx = uint32(0); sdx < splitSubMapSize; sdx++ {
+			size, ctrl, groups = uint32(len(lm.subs[sdx].groups)), lm.subs[sdx].ctrl, lm.subs[sdx].groups
+			for g := uintptr(0); g < uintptr(size); g++ {
+				meta = (*swissMetadata)(unsafe.Pointer(uintptr(unsafe.Pointer(ctrl)) + g<<3))
+				for s, c := range *meta {
 					if c == swissEmpty || c == swissTombstone {
 						continue
 					}
@@ -412,20 +494,15 @@ func (m *SwissMap[K, V]) Iter(cb func(k K, v V) (stop bool)) {
 						return
 					}
 				}
-				g++
-				if g >= uint32(len(groups)) {
-					g = 0
-				}
 			}
 		}
 		return
 	}
 
-	ctrl, groups := m.ctrl, m.groups
-	// pick a random starting swissGroup
-	g := swissRandIntN(len(groups))
-	for n := 0; n < len(groups); n++ {
-		for s, c := range ctrl[g] {
+	size, ctrl, groups = uint32(len(m.groups)), m.ctrl, m.groups
+	for g := uintptr(0); g < uintptr(size); g++ {
+		meta = (*swissMetadata)(unsafe.Pointer(uintptr(unsafe.Pointer(ctrl)) + g<<3))
+		for s, c := range *meta {
 			if c == swissEmpty || c == swissTombstone {
 				continue
 			}
@@ -434,30 +511,26 @@ func (m *SwissMap[K, V]) Iter(cb func(k K, v V) (stop bool)) {
 				return
 			}
 		}
-		g++
-		if g >= uint32(len(groups)) {
-			g = 0
-		}
 	}
 }
 
 // Clear removes all elements from the SwissMap.
 func (m *SwissMap[K, V]) Clear() {
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
+		lm := (*SwissLarge[K, V])(unsafe.Pointer(m))
 		for sdx := uint32(0); sdx < splitSubMapSize; sdx++ {
-			t64 := (*[]uint64)(unsafe.Pointer(&lm.subs[sdx].ctrl))
-			for i := range *t64 {
-				(*t64)[i] = swissEmpty64
+			groupm := uint32(len(lm.subs[sdx].groups)) << 3
+			for i := uintptr(0); i < uintptr(groupm); i += 8 {
+				*(*uint64)(unsafe.Pointer(uintptr(unsafe.Pointer(lm.subs[sdx].ctrl)) + i)) = swissEmpty64
 			}
 			lm.subs[sdx].resident, lm.subs[sdx].dead = 0, 0
 		}
 		return
 	}
 
-	t64 := (*[]uint64)(unsafe.Pointer(&m.ctrl))
-	for i := range *t64 {
-		(*t64)[i] = swissEmpty64
+	groupm := uint32(len(m.groups)) << 3
+	for i := uintptr(0); i < uintptr(groupm); i += 8 {
+		*(*uint64)(unsafe.Pointer(uintptr(unsafe.Pointer(m.ctrl)) + i)) = swissEmpty64
 	}
 	m.resident, m.dead = 0, 0
 }
@@ -465,7 +538,7 @@ func (m *SwissMap[K, V]) Clear() {
 // Count returns the number of elements in the SwissMap.
 func (m *SwissMap[K, V]) Count() int {
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
+		lm := (*SwissLarge[K, V])(unsafe.Pointer(m))
 		var n = 0
 		for sdx := uint32(0); sdx < splitSubMapSize; sdx++ {
 			n += int(lm.subs[sdx].resident - lm.subs[sdx].dead)
@@ -479,7 +552,7 @@ func (m *SwissMap[K, V]) Count() int {
 // they can be added to the SwissMap before resizing.
 func (m *SwissMap[K, V]) Capacity() int {
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
+		lm := (*SwissLarge[K, V])(unsafe.Pointer(m))
 		var n = 0
 		for sdx := uint32(0); sdx < splitSubMapSize; sdx++ {
 			n += int(lm.subs[sdx].limit - lm.subs[sdx].resident)
@@ -492,13 +565,22 @@ func (m *SwissMap[K, V]) Capacity() int {
 // find returns the location of |key| if present, or its insertion location if absent.
 // for performance, find is manually inlined into public methods.
 func (m *SwissMap[K, V]) find(key K, hi swissH1, lo swissH2) (i int32, g, s uint32, ok bool) {
+	var (
+		lm      *SwissLarge[K, V]
+		meta    *uint64
+		matches uint64
+		size    uint32
+		sdx     uint8
+	)
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
-		sdx := uint8(hi)
+		lm = (*SwissLarge[K, V])(unsafe.Pointer(m))
+		sdx = uint8(hi)
 
-		g = swissProbeStart(hi, len(lm.subs[sdx].groups))
+		size = uint32(len(lm.subs[sdx].groups))
+		g = swissProbeStart(hi, size)
 		for {
-			matches := swissMetaMatchH2(&lm.subs[sdx].ctrl[g], lo)
+			meta = _u64(lm.subs[sdx].ctrl, g)
+			matches = swissMetaMatchH2(meta, lo)
 			for matches != 0 {
 				s = swissNextMatch(&matches)
 				if key == lm.subs[sdx].groups[g].keys[s] {
@@ -507,13 +589,13 @@ func (m *SwissMap[K, V]) find(key K, hi swissH1, lo swissH2) (i int32, g, s uint
 			}
 			// |key| is not in swissGroup |g|,
 			// stop probing if we see an swissEmpty slot
-			matches = swissMetaMatchEmpty(&lm.subs[sdx].ctrl[g])
+			matches = swissMetaMatchEmpty(meta)
 			if matches != 0 {
 				s = swissNextMatch(&matches)
 				return int32(sdx), g, s, false
 			}
 			g += 1 // linear probing
-			if g >= uint32(len(lm.subs[sdx].groups)) {
+			if g >= size {
 				g = 0
 			}
 		}
@@ -521,9 +603,11 @@ func (m *SwissMap[K, V]) find(key K, hi swissH1, lo swissH2) (i int32, g, s uint
 		return
 	}
 
-	g = swissProbeStart(hi, len(m.groups))
+	size = uint32(len(m.groups))
+	g = swissProbeStart(hi, size)
 	for {
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
+		meta = _u64(m.ctrl, g)
+		matches = swissMetaMatchH2(meta, lo)
 		for matches != 0 {
 			s = swissNextMatch(&matches)
 			if key == m.groups[g].keys[s] {
@@ -532,20 +616,20 @@ func (m *SwissMap[K, V]) find(key K, hi swissH1, lo swissH2) (i int32, g, s uint
 		}
 		// |key| is not in swissGroup |g|,
 		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
+		matches = swissMetaMatchEmpty(meta)
 		if matches != 0 {
 			s = swissNextMatch(&matches)
 			return -1, g, s, false
 		}
 		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
+		if g >= size {
 			g = 0
 		}
 	}
 }
 
 func (m *SwissMap[K, V]) subNextSize(sdx uint8) (n uint32) {
-	lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
+	lm := (*SwissLarge[K, V])(unsafe.Pointer(m))
 
 	n = uint32(len(lm.subs[sdx].groups)) * 2
 	if lm.subs[sdx].dead >= (lm.subs[sdx].resident / 2) {
@@ -554,23 +638,34 @@ func (m *SwissMap[K, V]) subNextSize(sdx uint8) (n uint32) {
 	return
 }
 
-func (m *SwissMap[K, V]) subRehash(sdx uint8, n uint32) {
-	lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
+func (m *SwissMap[K, V]) subRehash(sdx uint8, groupn uint32) {
+	var (
+		lm     *SwissLarge[K, V]
+		meta   *swissMetadata
+		size   uint32
+		ctrl   *uint64
+		groups []swissGroup[K, V]
+	)
+	lm = (*SwissLarge[K, V])(unsafe.Pointer(m))
 
-	groups, ctrl := lm.subs[sdx].groups, lm.subs[sdx].ctrl
-	lm.subs[sdx].groups = make([]swissGroup[K, V], n)
-	lm.subs[sdx].ctrl = make([]swissMetadata, n)
+	size, ctrl, groups = uint32(len(lm.subs[sdx].groups)), lm.subs[sdx].ctrl, lm.subs[sdx].groups
 
-	t64 := (*[]uint64)(unsafe.Pointer(&lm.subs[sdx].ctrl))
-	for i := range *t64 {
-		(*t64)[i] = swissEmpty64
+	ctrl_ := make([]uint64, groupn)
+	groupm := groupn << 3
+
+	lm.subs[sdx].ctrl = (*SwissUint64Slice)(unsafe.Pointer(&ctrl_)).Ptr
+	lm.subs[sdx].groups = make([]swissGroup[K, V], groupn)
+
+	for i := uintptr(0); i < uintptr(groupm); i += 8 {
+		*(*uint64)(unsafe.Pointer(uintptr(unsafe.Pointer(lm.subs[sdx].ctrl)) + i)) = swissEmpty64
 	}
 
-	lm.subs[sdx].limit = n * swissMaxAvgGroupLoad
+	lm.subs[sdx].limit = groupn * swissMaxAvgGroupLoad
 	lm.subs[sdx].resident, lm.subs[sdx].dead = 0, 0
-	for g := range ctrl {
-		for s := range ctrl[g] {
-			c := ctrl[g][s]
+
+	for g := uintptr(0); g < uintptr(size); g++ {
+		meta = (*swissMetadata)(unsafe.Pointer(uintptr(unsafe.Pointer(ctrl)) + g<<3))
+		for s, c := range *meta {
 			if c == swissEmpty || c == swissTombstone {
 				continue
 			}
@@ -588,22 +683,32 @@ func (m *SwissMap[K, V]) nextSize() (n uint32) {
 	return
 }
 
-func (m *SwissMap[K, V]) rehash(n uint32) {
+func (m *SwissMap[K, V]) rehash(groupn uint32) {
 	// flagLargeMap use sub rehash
-	groups, ctrl := m.groups, m.ctrl
-	m.groups = make([]swissGroup[K, V], n)
-	m.ctrl = make([]swissMetadata, n)
+	var (
+		meta   *swissMetadata
+		size   uint32
+		groupm uint32
+		ctrl   *uint64
+		groups []swissGroup[K, V]
+	)
+	size, ctrl, groups = uint32(len(m.groups)), m.ctrl, m.groups
 
-	t64 := (*[]uint64)(unsafe.Pointer(&m.ctrl))
-	for i := range *t64 {
-		(*t64)[i] = swissEmpty64
+	ctrl_ := make([]uint64, groupn)
+	groupm = groupn << 3
+	m.ctrl = (*SwissUint64Slice)(unsafe.Pointer(&ctrl_)).Ptr
+	m.groups = make([]swissGroup[K, V], groupn)
+
+	for i := uintptr(0); i < uintptr(groupm); i += 8 {
+		*(*uint64)(unsafe.Pointer(uintptr(unsafe.Pointer(m.ctrl)) + i)) = swissEmpty64
 	}
 
-	m.limit = n * swissMaxAvgGroupLoad
+	m.limit = groupn * swissMaxAvgGroupLoad
 	m.resident, m.dead = 0, 0
-	for g := range ctrl {
-		for s := range ctrl[g] {
-			c := ctrl[g][s]
+
+	for g := uintptr(0); g < uintptr(size); g++ {
+		meta = (*swissMetadata)(unsafe.Pointer(uintptr(unsafe.Pointer(ctrl)) + g<<3))
+		for s, c := range *meta {
 			if c == swissEmpty || c == swissTombstone {
 				continue
 			}
@@ -613,13 +718,26 @@ func (m *SwissMap[K, V]) rehash(n uint32) {
 }
 
 func (m *SwissMap[K, V]) loadFactor() float32 {
-	slots := float32(len(m.groups) * swissGroupSize)
-	return float32(m.resident-m.dead) / slots
+	var (
+		num   = 0
+		slots = float32(0.0)
+	)
+	if m.flags == flagLargeMap {
+		lm := (*SwissLarge[K, V])(unsafe.Pointer(m))
+		for sdx := uint32(0); sdx < splitSubMapSize; sdx++ {
+			num += int(lm.subs[sdx].resident - lm.subs[sdx].dead)
+			slots += float32(len(lm.subs[sdx].groups) * swissGroupSize)
+		}
+	} else {
+		num = int(m.resident - m.dead)
+		slots = float32(len(m.groups) * swissGroupSize)
+	}
+	return float32(num) / slots
 }
 
 func (m *SwissMap[K, V]) getResident() int {
 	if m.flags == flagLargeMap {
-		lm := (*SwissLargeMap[K, V])(unsafe.Pointer(m))
+		lm := (*SwissLarge[K, V])(unsafe.Pointer(m))
 		var n = 0
 		for sdx := uint32(0); sdx < splitSubMapSize; sdx++ {
 			n += int(lm.subs[sdx].resident)
@@ -649,8 +767,8 @@ func swissSplitHash(h uint64) (swissH1, swissH2) {
 	return swissH1((h & swissH1Mask) >> 7), swissH2(h & swissH2Mask)
 }
 
-func swissProbeStart(hi swissH1, groups int) uint32 {
-	return swissFastModN(uint32(hi), uint32(groups))
+func swissProbeStart(hi swissH1, groups uint32) uint32 {
+	return swissFastModN(uint32(hi), groups)
 }
 
 // lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
@@ -658,18 +776,13 @@ func swissFastModN(x, n uint32) uint32 {
 	return uint32((uint64(x) * uint64(n)) >> 32)
 }
 
-// swissRandIntN returns a random number in the interval [0, n).
-func swissRandIntN(n int) uint32 {
-	return swissFastModN(fastrand(), uint32(n))
-}
-
-func swissMetaMatchH2(m *swissMetadata, h swissH2) uint64 {
+func swissMetaMatchH2(m *uint64, h swissH2) uint64 {
 	// https://graphics.stanford.edu/~seander/bithacks.html##ValueInWord
-	return swissHasZeroByte(*(*uint64)((unsafe.Pointer)(m)) ^ (swissLoBits * uint64(h)))
+	return swissHasZeroByte(*m ^ (swissLoBits * uint64(h)))
 }
 
-func swissMetaMatchEmpty(m *swissMetadata) uint64 {
-	return swissHasZeroByte(*(*uint64)((unsafe.Pointer)(m)) ^ swissHiBits)
+func swissMetaMatchEmpty(m *uint64) uint64 {
+	return swissHasZeroByte(*m ^ swissHiBits)
 }
 
 func swissNextMatch(b *uint64) uint32 {

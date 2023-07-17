@@ -20,17 +20,17 @@ func TestSwissMatchMetadata(t *testing.T) {
 	}
 	t.Run("swissMetaMatchH2", func(t *testing.T) {
 		for _, x := range meta {
-			mask := swissMetaMatchH2(&meta, swissH2(x))
+			mask := swissMetaMatchH2((*uint64)(unsafe.Pointer(&meta)), swissH2(x))
 			assert.NotZero(t, mask)
 			assert.Equal(t, uint32(x), swissNextMatch(&mask))
 		}
 	})
 	t.Run("swissMetaMatchEmpty", func(t *testing.T) {
-		mask := swissMetaMatchEmpty(&meta)
+		mask := swissMetaMatchEmpty((*uint64)(unsafe.Pointer(&meta)))
 		assert.Equal(t, mask, uint64(0))
 		for i := range meta {
 			meta[i] = swissEmpty
-			mask = swissMetaMatchEmpty(&meta)
+			mask = swissMetaMatchEmpty((*uint64)(unsafe.Pointer(&meta)))
 			assert.NotZero(t, mask)
 			assert.Equal(t, uint32(i), swissNextMatch(&mask))
 			meta[i] = int8(i)
@@ -39,14 +39,14 @@ func TestSwissMatchMetadata(t *testing.T) {
 	t.Run("swissNextMatch", func(t *testing.T) {
 		// test iterating multiple matches
 		meta = swissNewEmptyMetadata()
-		mask := swissMetaMatchEmpty(&meta)
+		mask := swissMetaMatchEmpty((*uint64)(unsafe.Pointer(&meta)))
 		for i := range meta {
 			assert.Equal(t, uint32(i), swissNextMatch(&mask))
 		}
 		for i := 0; i < len(meta); i += 2 {
 			meta[i] = int8(42)
 		}
-		mask = swissMetaMatchH2(&meta, swissH2(42))
+		mask = swissMetaMatchH2((*uint64)(unsafe.Pointer(&meta)), swissH2(42))
 		for i := 0; i < len(meta); i += 2 {
 			assert.Equal(t, uint32(i), swissNextMatch(&mask))
 		}
@@ -60,7 +60,7 @@ func BenchmarkSwissMatchMetadata(b *testing.B) {
 	}
 	var mask uint64
 	for i := 0; i < b.N; i++ {
-		mask = swissMetaMatchH2(&meta, swissH2(i))
+		mask = swissMetaMatchH2((*uint64)(unsafe.Pointer(&meta)), swissH2(i))
 	}
 	b.Log(mask)
 }
@@ -446,12 +446,12 @@ func swissGetProbeLength[K comparable, V any](t *testing.T, m *SwissMap[K, V], k
 		end uint32
 	)
 	hi, lo := swissSplitHash(m.hash.Hash64(key))
-	start := swissProbeStart(hi, len(m.groups))
 	i, end, _, ok = m.find(key, hi, lo)
-	if i >= 0 { // splitSubMap
+	if i >= 0 { // splitSubMap  skip
 		return
 	}
 
+	start := swissProbeStart(hi, uint32(len(m.groups)))
 	if end < start { // wrapped
 		end += uint32(len(m.groups))
 	}

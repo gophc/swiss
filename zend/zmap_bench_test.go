@@ -15,12 +15,13 @@ func BenchmarkStrSwissMaps(b *testing.B) {
 	const keySz = 8
 	sizes := []int{16, 128, 1024, 1024 * 8, 1024 * 64, 1024 * 512, 1024 * 1024}
 	for _, n := range sizes {
+		data := genSwissStringData(keySz, n)
 		b.Run("n="+strconv.Itoa(n), func(b *testing.B) {
 			b.Run("runtime map", func(b *testing.B) {
-				benchmarkSwissStdMap(b, genSwissStringData(keySz, n))
+				benchmarkSwissStdMap(b, data)
 			})
 			b.Run("swiss.SwissMap", func(b *testing.B) {
-				benchmarkSwissMap(b, genSwissStringData(keySz, n))
+				benchmarkSwissMap(b, data)
 			})
 		})
 	}
@@ -29,12 +30,13 @@ func BenchmarkStrSwissMaps(b *testing.B) {
 func BenchmarkInt64SwissMaps(b *testing.B) {
 	sizes := []int{16, 128, 1024, 1024 * 8, 1024 * 64, 1024 * 512, 1024 * 1024 * 4}
 	for _, n := range sizes {
+		data := generateSwissInt64Data(n)
 		b.Run("n="+strconv.Itoa(n), func(b *testing.B) {
 			b.Run("runtime map", func(b *testing.B) {
-				benchmarkSwissStdMap(b, generateSwissInt64Data(n))
+				benchmarkSwissStdMap(b, data)
 			})
 			b.Run("swiss.SwissMap", func(b *testing.B) {
-				benchmarkSwissMap(b, generateSwissInt64Data(n))
+				benchmarkSwissMap(b, data)
 			})
 		})
 	}
@@ -60,6 +62,13 @@ func TestMemorySwissFootprint(t *testing.T) {
 	t.Logf("mean size ratio: %.3f", swissMean(samples))
 }
 
+func TestMemorySwissMapDbg(t *testing.T) {
+	keys := genSwissStringData(16, 34_000)
+	t.Run("iter", func(t *testing.T) {
+		testSwissMapIter(t, keys)
+	})
+}
+
 func benchmarkSwissStdMap[K comparable](b *testing.B, keys []K) {
 	n := uint32(len(keys))
 	mod := n - 1 // power of 2 fast modulus
@@ -71,7 +80,7 @@ func benchmarkSwissStdMap[K comparable](b *testing.B, keys []K) {
 	b.ResetTimer()
 	var ok bool
 	for i := 0; i < b.N; i++ {
-		_, ok = m[keys[uint32(i)&mod]]
+		_, ok = m[keys[uint32(i*17)&mod]]
 	}
 	assert.True(b, ok)
 	b.ReportAllocs()
@@ -88,7 +97,7 @@ func benchmarkSwissMap[K comparable](b *testing.B, keys []K) {
 	b.ResetTimer()
 	var ok bool
 	for i := 0; i < b.N; i++ {
-		_, ok = m.Get(keys[uint32(i)&mod])
+		_, ok = m.Get(keys[uint32(i*17)&mod])
 	}
 	assert.True(b, ok)
 	b.ReportAllocs()
