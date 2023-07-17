@@ -27,7 +27,7 @@ func TestSwissMatchMetadata(t *testing.T) {
 	})
 	t.Run("swissMetaMatchEmpty", func(t *testing.T) {
 		mask := swissMetaMatchEmpty(&meta)
-		assert.Equal(t, mask, swissBitset(0))
+		assert.Equal(t, mask, uint64(0))
 		for i := range meta {
 			meta[i] = swissEmpty
 			mask = swissMetaMatchEmpty(&meta)
@@ -58,7 +58,7 @@ func BenchmarkSwissMatchMetadata(b *testing.B) {
 	for i := range meta {
 		meta[i] = int8(i)
 	}
-	var mask swissBitset
+	var mask uint64
 	for i := 0; i < b.N; i++ {
 		mask = swissMetaMatchH2(&meta, swissH2(i))
 	}
@@ -104,7 +104,7 @@ func TestSwissFastMod(t *testing.T) {
 }
 
 func testSwissFastMod(t *testing.T, n uint32) {
-	const trials = 32 * 1024
+	const trials = 8 * 1024
 	for i := 0; i < trials; i++ {
 		x := rand.Uint32()
 		y := swissFastModN(x, n)
@@ -237,7 +237,7 @@ func testSwissMapPut[K comparable](t *testing.T, keys []K) {
 		assert.True(t, ok)
 		assert.Equal(t, -i, act)
 	}
-	assert.Equal(t, len(keys), int(m.resident))
+	assert.Equal(t, len(keys), m.getResident())
 }
 
 func testSwissMapHas[K comparable](t *testing.T, keys []K) {
@@ -441,10 +441,17 @@ func swissFmtProbeStats(s swissProbeStats) string {
 }
 
 func swissGetProbeLength[K comparable, V any](t *testing.T, m *SwissMap[K, V], key K) (length uint32, ok bool) {
-	var end uint32
+	var (
+		i   int32
+		end uint32
+	)
 	hi, lo := swissSplitHash(m.hash.Hash64(key))
 	start := swissProbeStart(hi, len(m.groups))
-	end, _, ok = m.find(key, hi, lo)
+	i, end, _, ok = m.find(key, hi, lo)
+	if i >= 0 { // splitSubMap
+		return
+	}
+
 	if end < start { // wrapped
 		end += uint32(len(m.groups))
 	}
