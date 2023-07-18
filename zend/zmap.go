@@ -15,6 +15,52 @@ const (
 
 type swissBitset uint64
 
+type hashfn func(unsafe.Pointer, uintptr) uintptr
+
+// Hasher hashes values of type K.
+// Uses runtime AES-based hashing.
+type Hasher[K comparable] struct {
+	hash hashfn
+	seed uintptr
+}
+
+// NewHasher creates a new Hasher[K] with a random seed.
+func NewHasher[K comparable]() Hasher[K] {
+	h, ss := getRuntimeHasher[K]()
+	return Hasher[K]{hash: h, seed: ss}
+}
+
+// NewSeed returns a copy of |h| with a new hash seed.
+func NewSeed[K comparable](h Hasher[K]) Hasher[K] {
+	return Hasher[K]{
+		hash: h.hash,
+		seed: uintptr(fastrand64()),
+	}
+}
+
+// Hash hashes |key|.
+func (h Hasher[K]) Hash(key K) uintptr {
+	// promise to the compiler that pointer
+	// |p| does not escape the stack.
+	p := noescape(unsafe.Pointer(&key))
+	return h.hash(p, h.seed)
+}
+
+// Hash64 hashes |key|.
+func (h Hasher[K]) Hash64(key K) uint64 {
+	// promise to the compiler that pointer
+	// |p| does not escape the stack.
+	p := noescape(unsafe.Pointer(&key))
+	return uint64(h.hash(p, h.seed))
+}
+
+func getRuntimeHasher[K comparable]() (h hashfn, seed uintptr) {
+	a := any(make(map[K]struct{}))
+	i := (*mapiface)(unsafe.Pointer(&a))
+	h, seed = i.typ.hasher, uintptr(i.val.hash0)
+	return
+}
+
 func swissMetaMatchH2(m *swissMetadata, h swissH2) swissBitset {
 	// https://graphics.stanford.edu/~seander/bithacks.html##ValueInWord
 	return swissHasZeroByte(*(*uint64)((unsafe.Pointer)(m)) ^ (swissLoBits * uint64(h)))
