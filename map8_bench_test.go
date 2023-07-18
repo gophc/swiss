@@ -1,6 +1,7 @@
 package swiss
 
 import (
+	"github.com/dolthub/swiss/minswiss"
 	"github.com/dolthub/swiss/zend"
 	"github.com/stretchr/testify/require"
 	"math/bits"
@@ -51,6 +52,10 @@ func BenchmarkInt64Maps8(b *testing.B) {
 
 			b.Run("zend.SwissMap", func(b *testing.B) {
 				benchmarkSwissZMap(b, data)
+			})
+
+			b.Run("minswiss.SwissMap", func(b *testing.B) {
+				benchmarkSwissMinMap(b, data)
 			})
 		})
 	}
@@ -115,6 +120,23 @@ func benchmarkSwissZMap[K comparable](b *testing.B, keys []K) {
 	mod := n - 1 // power of 2 fast modulus
 	require.Equal(b, 1, bits.OnesCount32(n))
 	m := zend.NewSwissMap[K, K](n)
+	for _, k := range keys {
+		m.Put(k, k)
+	}
+	b.ResetTimer()
+	var ok bool
+	for i := 0; i < b.N; i++ {
+		_, ok = m.Get(keys[uint32(i*17)&mod])
+	}
+	assert.True(b, ok)
+	b.ReportAllocs()
+}
+
+func benchmarkSwissMinMap[K comparable](b *testing.B, keys []K) {
+	n := uint32(len(keys))
+	mod := n - 1 // power of 2 fast modulus
+	require.Equal(b, 1, bits.OnesCount32(n))
+	m := minswiss.NewSwissMap[K, K](n)
 	for _, k := range keys {
 		m.Put(k, k)
 	}
