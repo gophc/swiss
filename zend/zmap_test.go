@@ -98,6 +98,9 @@ func TestSwissFastMod(t *testing.T) {
 	t.Run("n=100", func(t *testing.T) {
 		testSwissFastMod(t, 100)
 	})
+	t.Run("n=255", func(t *testing.T) {
+		testSwissFastMod(t, 255)
+	})
 	t.Run("n=1000", func(t *testing.T) {
 		testSwissFastMod(t, 1000)
 	})
@@ -109,7 +112,7 @@ func testSwissFastMod(t *testing.T, n uint32) {
 		x := rand.Uint32()
 		y := swissFastModN(x, n)
 		assert.Less(t, y, n)
-		t.Logf("swissFastModN(%d, %d): %d", x, n, y)
+		t.Logf("swissFastModN(%d #%0x, %d #%0x): %d #%0x", x, x, n, n, y, y)
 	}
 }
 

@@ -12,24 +12,108 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestSwissMinMap(t *testing.T) {
+	t.Run("strings=0", func(t *testing.T) {
+		testSwissMap8(t, genStringData8(16, 0))
+	})
+	t.Run("strings=100", func(t *testing.T) {
+		testSwissMinMap(t, genStringData8(16, 100))
+	})
+	t.Run("strings=1000", func(t *testing.T) {
+		testSwissMinMap(t, genStringData8(16, 1000))
+	})
+	t.Run("strings=10_000", func(t *testing.T) {
+		testSwissMinMap(t, genStringData8(16, 10_000))
+	})
+	t.Run("strings=100_000", func(t *testing.T) {
+		testSwissMinMap(t, genStringData8(16, 100_000))
+	})
+	t.Run("uint32=0", func(t *testing.T) {
+		testSwissMinMap(t, genUint32Data8(0))
+	})
+	t.Run("uint32=100", func(t *testing.T) {
+		testSwissMinMap(t, genUint32Data8(100))
+	})
+	t.Run("uint32=1000", func(t *testing.T) {
+		testSwissMinMap(t, genUint32Data8(1000))
+	})
+	t.Run("uint32=10_000", func(t *testing.T) {
+		testSwissMinMap(t, genUint32Data8(10_000))
+	})
+	t.Run("uint32=100_000", func(t *testing.T) {
+		testSwissMinMap(t, genUint32Data8(100_000))
+	})
+}
+
+func testSwissMinMap[K comparable](t *testing.T, keys []K) {
+	// sanity check
+	require.Equal(t, len(keys), len(uniq8(keys)), keys)
+	t.Run("put", func(t *testing.T) {
+		testSwissMinMapPut(t, keys)
+	})
+	t.Run("get", func(t *testing.T) {
+		testSwissMinMapGet(t, keys)
+	})
+}
+
+func testSwissMinMapPut[K comparable](t *testing.T, keys []K) {
+	m := minswiss.NewSwissMap[K, int](uint32(len(keys)))
+	assert.Equal(t, 0, m.Count())
+	for i, key := range keys {
+		m.Put(key, i)
+	}
+	assert.Equal(t, len(keys), m.Count())
+	// overwrite
+	for i, key := range keys {
+		m.Put(key, -i)
+	}
+	assert.Equal(t, len(keys), m.Count())
+	for i, key := range keys {
+		act, ok := m.Get(key)
+		assert.True(t, ok)
+		assert.Equal(t, -i, act)
+	}
+	assert.Equal(t, len(keys), int(m.GetResident()))
+	assert.True(t, m.UnnecessaryCmp >= 0)
+}
+
+func testSwissMinMapGet[K comparable](t *testing.T, keys []K) {
+	m := minswiss.NewSwissMap[K, int](uint32(len(keys)))
+	for i, key := range keys {
+		m.Put(key, i)
+	}
+	for i, key := range keys {
+		act, ok := m.Get(key)
+		assert.True(t, ok)
+		assert.Equal(t, i, act)
+	}
+	assert.True(t, m.UnnecessaryCmp >= 0)
+}
+
 func BenchmarkStringMaps8(b *testing.B) {
-	const keySz = 8
-	sizes := []int{16, 128, 1024, 1024 * 8, 1024 * 64, 1024 * 512, 1024 * 1024 * 4}
+	const keySz = 16
+	sizes := []int{128, 1024 * 8, 1024 * 64, 1024 * 512, 1024 * 1024 * 4}
 	for _, n := range sizes {
 		data := genStringData8(keySz, n)
 		b.Run("n="+strconv.Itoa(n), func(b *testing.B) {
 			b.Run("runtime map", func(b *testing.B) {
 				benchmarkRuntimeMap8(b, data)
 			})
-			b.Run("swiss.Map", func(b *testing.B) {
+
+			/* b.Run("swiss.Map", func(b *testing.B) {
 				benchmarkSwissMap(b, data)
-			})
+			}) */
+
 			b.Run("swiss.Map8", func(b *testing.B) {
 				benchmarkSwissMap8(b, data)
 			})
 
-			b.Run("zend.SwissMap", func(b *testing.B) {
+			/* b.Run("zend.SwissMap", func(b *testing.B) {
 				benchmarkSwissZMap(b, data)
+			}) */
+
+			b.Run("minswiss.SwissMap", func(b *testing.B) {
+				benchmarkSwissMinMap(b, data)
 			})
 		})
 	}

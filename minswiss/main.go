@@ -17,6 +17,142 @@ func main() {
 	println(m.Get(456))
 }
 
+// Get returns the |value| mapped by |key| if one exists.
+func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
+	h := m.hash.Hash64(key)
+	hi, lo := uint32((h&swissH1Mask)>>7), int8(h&swissH2Mask)
+	mk := uint8(hi)
+	size := uint32(len(m.groups))
+	g := uint32((uint64(hi) * uint64(size)) >> 32)
+	for { // inlined find loop
+		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g]))
+		matches := swissMetaMatchH2(meta, lo)
+		for matches != 0 {
+			s := swissNextMatch(&matches)
+			if s < swissGroupSize {
+				if m.ctrl[g].mask[s] == mk && key == m.groups[g].keys[s] {
+					value, ok = m.groups[g].values[s], true
+					return
+				}
+			}
+		}
+		// |key| is not in swissGroup |g|,
+		// stop probing if we see an swissEmpty slot
+		matches = swissMetaMatchEmpty(meta)
+		if matches != 0 {
+			ok = false
+			return
+		}
+		m.UnnecessaryCmp += 1
+		g += 1 // linear probing
+		if g >= size {
+			g = 0
+		}
+	}
+}
+
+// Put attempts to insert |key| and |value|
+func (m *SwissMap[K, V]) Put(key K, value V) {
+	h := m.hash.Hash64(key)
+	hi, lo := uint32((h&swissH1Mask)>>7), int8(h&swissH2Mask)
+	mk := uint8(hi)
+	size := uint32(len(m.groups))
+	g := uint32((uint64(hi) * uint64(size)) >> 32)
+	for { // inlined find loop
+		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g]))
+		matches := swissMetaMatchH2(meta, lo)
+		for matches != 0 {
+			s := swissNextMatch(&matches)
+			if key == m.groups[g].keys[s] { // update
+				m.groups[g].keys[s] = key
+				m.groups[g].values[s] = value
+				return
+			}
+		}
+		// |key| is not in swissGroup |g|,
+		// stop probing if we see an swissEmpty slot
+		matches = swissMetaMatchEmpty(meta)
+		if matches != 0 { // insert
+			s := swissNextMatch(&matches)
+			m.groups[g].keys[s] = key
+			m.groups[g].values[s] = value
+			m.ctrl[g].meta[s] = lo
+			m.ctrl[g].mask[s] = mk
+			m.resident++
+			return
+		}
+		g += 1 // linear probing
+		if g >= size {
+			g = 0
+		}
+	}
+}
+
+// Count returns the number of elements in the SwissMap.
+func (m *SwissMap[K, V]) Count() int {
+	return int(m.resident - m.dead)
+}
+
+func (m *SwissMap[K, V]) GetResident() uint32 {
+	return m.resident
+}
+
+// NewSwissMap constructs a SwissMap.
+//
+//goland:noinspection GoUnusedExportedFunction
+func NewSwissMap[K comparable, V any](sz uint32) (m *SwissMap[K, V]) {
+	groups := (sz + swissMaxAvgGroupLoad - 1) / swissMaxAvgGroupLoad
+	if groups == 0 {
+		groups = 1
+	} else if groups > 128 {
+		groups += groups >> 1
+	}
+
+	m = &SwissMap[K, V]{
+		ctrl:   make([]swissMetadata, groups),
+		groups: make([]swissGroup[K, V], groups),
+		hash:   NewHasher[K](),
+		limit:  groups * swissMaxAvgGroupLoad,
+	}
+
+	t64 := *(*[]swissMeta128)(unsafe.Pointer(&m.ctrl))
+	for i := range t64 {
+		t64[i].meta = swissEmpty64
+	}
+	return
+}
+
+// SwissMap is an open-addressing hash map
+// based on Abseil's flat_hash_map.
+type SwissMap[K comparable, V any] struct {
+	ctrl           []swissMetadata
+	groups         []swissGroup[K, V]
+	hash           Hasher[K]
+	UnnecessaryCmp int
+	resident       uint32
+	dead           uint32
+	limit          uint32
+}
+
+// swissMetadata is the swissH2 swissMetadata array for a swissGroup.
+// find operations first probe the controls bytes
+// to filter candidates before matching keys
+type swissMetadata struct {
+	meta [swissGroupSize]int8
+	mask [swissGroupSize]uint8
+}
+
+type swissMeta128 struct {
+	meta uint64
+	mask uint64
+}
+
+// swissGroup is a swissGroup of 16 key-value pairs
+type swissGroup[K comparable, V any] struct {
+	keys   [swissGroupSize]K
+	values [swissGroupSize]V
+}
+
 // noescape hides a pointer from escape analysis. It is the identity function
 // but escape analysis doesn't think the output depends on the input.
 // noescape is inlined and currently compiles down to zero instructions.
@@ -146,117 +282,8 @@ const (
 	swissMaxLoadFactor = float32(swissMaxAvgGroupLoad) / float32(swissGroupSize)
 )
 
-// SwissMap is an open-addressing hash map
-// based on Abseil's flat_hash_map.
-type SwissMap[K comparable, V any] struct {
-	ctrl     []swissMetadata
-	groups   []swissGroup[K, V]
-	hash     Hasher[K]
-	resident uint32
-	dead     uint32
-	limit    uint32
-}
-
-// swissMetadata is the swissH2 swissMetadata array for a swissGroup.
-// find operations first probe the controls bytes
-// to filter candidates before matching keys
-type swissMetadata [swissGroupSize]int8
-
-// swissGroup is a swissGroup of 16 key-value pairs
-type swissGroup[K comparable, V any] struct {
-	keys   [swissGroupSize]K
-	values [swissGroupSize]V
-}
-
 const (
 	swissH1Mask  uint64 = 0xffff_ffff_ffff_ff80
 	swissH2Mask  uint64 = 0x0000_0000_0000_007f
 	swissEmpty64 uint64 = 0x8080_8080_8080_8080 // 0b1000_0000
 )
-
-// NewSwissMap constructs a SwissMap.
-//
-//goland:noinspection GoUnusedExportedFunction
-func NewSwissMap[K comparable, V any](sz uint32) (m *SwissMap[K, V]) {
-	groups := (sz + swissMaxAvgGroupLoad - 1) / swissMaxAvgGroupLoad
-	if groups == 0 {
-		groups = 1
-	}
-
-	m = &SwissMap[K, V]{
-		ctrl:   make([]swissMetadata, groups),
-		groups: make([]swissGroup[K, V], groups),
-		hash:   NewHasher[K](),
-		limit:  groups * swissMaxAvgGroupLoad,
-	}
-	t64 := *(*[]uint64)(unsafe.Pointer(&m.ctrl))
-	for i := range t64 {
-		t64[i] = swissEmpty64
-	}
-	return
-}
-
-// Get returns the |value| mapped by |key| if one exists.
-func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
-	h := m.hash.Hash64(key)
-	hi, lo := uint32((h&swissH1Mask)>>7), int8(h&swissH2Mask)
-	size := uint32(len(m.groups))
-	g := uint32((uint64(hi) * uint64(size)) >> 32)
-	for { // inlined find loop
-		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g]))
-		matches := swissMetaMatchH2(meta, lo)
-		for matches != 0 {
-			s := swissNextMatch(&matches)
-			if key == m.groups[g].keys[s] {
-				value, ok = m.groups[g].values[s], true
-				return
-			}
-		}
-		// |key| is not in swissGroup |g|,
-		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(meta)
-		if matches != 0 {
-			ok = false
-			return
-		}
-		g += 1 // linear probing
-		if g >= size {
-			g = 0
-		}
-	}
-}
-
-// Put attempts to insert |key| and |value|
-func (m *SwissMap[K, V]) Put(key K, value V) {
-	h := m.hash.Hash64(key)
-	hi, lo := uint32((h&swissH1Mask)>>7), int8(h&swissH2Mask)
-	size := uint32(len(m.groups))
-	g := uint32((uint64(hi) * uint64(size)) >> 32)
-	for { // inlined find loop
-		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g]))
-		matches := swissMetaMatchH2(meta, lo)
-		for matches != 0 {
-			s := swissNextMatch(&matches)
-			if key == m.groups[g].keys[s] { // update
-				m.groups[g].keys[s] = key
-				m.groups[g].values[s] = value
-				return
-			}
-		}
-		// |key| is not in swissGroup |g|,
-		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(meta)
-		if matches != 0 { // insert
-			s := swissNextMatch(&matches)
-			m.groups[g].keys[s] = key
-			m.groups[g].values[s] = value
-			m.ctrl[g][s] = lo
-			m.resident++
-			return
-		}
-		g += 1 // linear probing
-		if g >= size {
-			g = 0
-		}
-	}
-}
