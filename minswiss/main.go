@@ -29,11 +29,9 @@ func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
 		matches := swissMetaMatchH2(meta, lo)
 		for matches != 0 {
 			s := swissNextMatch(&matches)
-			if s < swissGroupSize {
-				if m.ctrl[g].mask[s] == mk && key == m.groups[g].keys[s] {
-					value, ok = m.groups[g].values[s], true
-					return
-				}
+			if m.ctrl[g].masks[s] == mk && key == m.groups[g].keys[s] {
+				value, ok = m.groups[g].values[s], true
+				return
 			}
 		}
 		// |key| is not in swissGroup |g|,
@@ -59,11 +57,11 @@ func (m *SwissMap[K, V]) Put(key K, value V) {
 	size := uint32(len(m.groups))
 	g := uint32((uint64(hi) * uint64(size)) >> 32)
 	for { // inlined find loop
-		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g]))
+		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g].flags))
 		matches := swissMetaMatchH2(meta, lo)
 		for matches != 0 {
 			s := swissNextMatch(&matches)
-			if key == m.groups[g].keys[s] { // update
+			if m.ctrl[g].masks[s] == mk && key == m.groups[g].keys[s] { // update
 				m.groups[g].keys[s] = key
 				m.groups[g].values[s] = value
 				return
@@ -76,8 +74,8 @@ func (m *SwissMap[K, V]) Put(key K, value V) {
 			s := swissNextMatch(&matches)
 			m.groups[g].keys[s] = key
 			m.groups[g].values[s] = value
-			m.ctrl[g].meta[s] = lo
-			m.ctrl[g].mask[s] = mk
+			m.ctrl[g].flags[s] = lo
+			m.ctrl[g].masks[s] = mk
 			m.resident++
 			return
 		}
@@ -117,7 +115,7 @@ func NewSwissMap[K comparable, V any](sz uint32) (m *SwissMap[K, V]) {
 
 	t64 := *(*[]swissMeta128)(unsafe.Pointer(&m.ctrl))
 	for i := range t64 {
-		t64[i].meta = swissEmpty64
+		t64[i].flag = swissEmpty64
 	}
 	return
 }
@@ -138,12 +136,12 @@ type SwissMap[K comparable, V any] struct {
 // find operations first probe the controls bytes
 // to filter candidates before matching keys
 type swissMetadata struct {
-	meta [swissGroupSize]int8
-	mask [swissGroupSize]uint8
+	flags [swissGroupSize]int8
+	masks [swissGroupSize]uint8
 }
 
 type swissMeta128 struct {
-	meta uint64
+	flag uint64
 	mask uint64
 }
 
