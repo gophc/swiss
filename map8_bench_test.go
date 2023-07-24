@@ -90,6 +90,125 @@ func testSwissMinMapGet[K comparable](t *testing.T, keys []K) {
 	assert.True(t, m.UnnecessaryCmp >= 0)
 }
 
+func TestZMap(t *testing.T) {
+	t.Run("strings=0", func(t *testing.T) {
+		testZMapStr(t, genStringData8(16, 0))
+	})
+	t.Run("strings=100", func(t *testing.T) {
+		testZMapStr(t, genStringData8(16, 100))
+	})
+	t.Run("strings=1000", func(t *testing.T) {
+		testZMapStr(t, genStringData8(16, 1000))
+	})
+	t.Run("strings=10_000", func(t *testing.T) {
+		testZMapStr(t, genStringData8(16, 10_000))
+	})
+	t.Run("strings=100_000", func(t *testing.T) {
+		testZMapStr(t, genStringData8(16, 100_000))
+	})
+	t.Run("uint32=0", func(t *testing.T) {
+		testZMap(t, genUint32Data8(0))
+	})
+	t.Run("uint32=100", func(t *testing.T) {
+		testZMap(t, genUint32Data8(100))
+	})
+	t.Run("uint32=1000", func(t *testing.T) {
+		testZMap(t, genUint32Data8(1000))
+	})
+	t.Run("uint32=10_000", func(t *testing.T) {
+		testZMap(t, genUint32Data8(10_000))
+	})
+	t.Run("uint32=100_000", func(t *testing.T) {
+		testZMap(t, genUint32Data8(100_000))
+	})
+}
+
+func testZMap(t *testing.T, keys []uint32) {
+	// sanity check
+	require.Equal(t, len(keys), len(uniq8(keys)), keys)
+	t.Run("put", func(t *testing.T) {
+		testZMapPut(t, keys)
+	})
+	t.Run("get", func(t *testing.T) {
+		testZMapGet(t, keys)
+	})
+}
+
+func testZMapPut(t *testing.T, keys []uint32) {
+	m := zend.NewZMap(uint32(len(keys)))
+	assert.Equal(t, 0, m.Count())
+	for i, key := range keys {
+		m.Put(zend.TZvalLong(int64(key)), zend.TZvalLong(int64(i)))
+	}
+	assert.Equal(t, len(keys), m.Count())
+	// overwrite
+	for i, key := range keys {
+		m.Put(zend.TZvalLong(int64(key)), zend.TZvalLong(int64(-i)))
+	}
+	assert.Equal(t, len(keys), m.Count())
+	for i, key := range keys {
+		act, ok := m.Get(zend.TZvalLong(int64(key)))
+		assert.True(t, ok)
+		assert.Equal(t, int64(-i), act.TZLong_())
+	}
+	assert.Equal(t, len(keys), int(m.GetResident()))
+}
+
+func testZMapGet(t *testing.T, keys []uint32) {
+	m := zend.NewZMap(uint32(len(keys)))
+	for i, key := range keys {
+		m.Put(zend.TZvalLong(int64(key)), zend.TZvalLong(int64(i)))
+	}
+	for i, key := range keys {
+		act, ok := m.Get(zend.TZvalLong(int64(key)))
+		assert.True(t, ok)
+		assert.Equal(t, int64(i), act.TZLong_())
+	}
+}
+
+func testZMapStr(t *testing.T, keys []string) {
+	// sanity check
+	require.Equal(t, len(keys), len(uniq8(keys)), keys)
+	t.Run("put", func(t *testing.T) {
+		testZMapPutStr(t, keys)
+	})
+	t.Run("get", func(t *testing.T) {
+		testZMapGetStr(t, keys)
+	})
+}
+
+func testZMapPutStr(t *testing.T, keys []string) {
+	m := zend.NewZMap(uint32(len(keys)))
+	assert.Equal(t, 0, m.Count())
+	for i, key := range keys {
+		m.Put(zend.TZvalStr(key), zend.TZvalLong(int64(i)))
+	}
+	assert.Equal(t, len(keys), m.Count())
+	// overwrite
+	for i, key := range keys {
+		m.Put(zend.TZvalStr(key), zend.TZvalLong(int64(-i)))
+	}
+	assert.Equal(t, len(keys), m.Count())
+	for i, key := range keys {
+		act, ok := m.Get(zend.TZvalStr(key))
+		assert.True(t, ok)
+		assert.Equal(t, int64(-i), act.TZLong_())
+	}
+	assert.Equal(t, len(keys), int(m.GetResident()))
+}
+
+func testZMapGetStr(t *testing.T, keys []string) {
+	m := zend.NewZMap(uint32(len(keys)))
+	for i, key := range keys {
+		m.Put(zend.TZvalStr(key), zend.TZvalLong(int64(i)))
+	}
+	for i, key := range keys {
+		act, ok := m.Get(zend.TZvalStr(key))
+		assert.True(t, ok)
+		assert.Equal(t, int64(i), act.TZLong_())
+	}
+}
+
 func BenchmarkStringMaps8(b *testing.B) {
 	const keySz = 16
 	sizes := []int{128, 1024 * 8, 1024 * 64, 1024 * 512, 1024 * 1024 * 4}
@@ -107,10 +226,6 @@ func BenchmarkStringMaps8(b *testing.B) {
 			b.Run("swiss.Map8", func(b *testing.B) {
 				benchmarkSwissMap8(b, data)
 			})
-
-			/* b.Run("zend.SwissMap", func(b *testing.B) {
-				benchmarkSwissZMap(b, data)
-			}) */
 
 			b.Run("minswiss.SwissMap", func(b *testing.B) {
 				benchmarkSwissMinMap(b, data)
@@ -132,10 +247,6 @@ func BenchmarkInt64Maps8(b *testing.B) {
 			})
 			b.Run("swiss.Map8", func(b *testing.B) {
 				benchmarkSwissMap8(b, data)
-			})
-
-			b.Run("zend.SwissMap", func(b *testing.B) {
-				benchmarkSwissZMap(b, data)
 			})
 
 			b.Run("minswiss.SwissMap", func(b *testing.B) {
@@ -187,23 +298,6 @@ func benchmarkSwissMap8[K comparable](b *testing.B, keys []K) {
 	mod := n - 1 // power of 2 fast modulus
 	require.Equal(b, 1, bits.OnesCount32(n))
 	m := NewMap8[K, K](n)
-	for _, k := range keys {
-		m.Put(k, k)
-	}
-	b.ResetTimer()
-	var ok bool
-	for i := 0; i < b.N; i++ {
-		_, ok = m.Get(keys[uint32(i*17)&mod])
-	}
-	assert.True(b, ok)
-	b.ReportAllocs()
-}
-
-func benchmarkSwissZMap[K comparable](b *testing.B, keys []K) {
-	n := uint32(len(keys))
-	mod := n - 1 // power of 2 fast modulus
-	require.Equal(b, 1, bits.OnesCount32(n))
-	m := zend.NewSwissMap[K, K](n)
 	for _, k := range keys {
 		m.Put(k, k)
 	}

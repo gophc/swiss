@@ -1,9 +1,579 @@
+//go:build go1.18 || go1.19 || go1.20
+
 package zend
 
 import (
 	"math/bits"
 	"unsafe"
 )
+
+//goland:noinspection GoUnusedFunction
+func main() {
+	m := NewZMap(16)
+	m.Put(TZvalLong(1), TZvalLong(4))
+	m.Put(TZvalLong(12), TZvalLong(45))
+	m.Put(TZvalLong(123), TZvalLong(456))
+	println(m.Get(TZvalLong(123)))
+	println(m.Get(TZvalLong(456)))
+
+	println(m.Get(TZvalStr("123")))
+}
+
+// Get returns the |value| mapped by |key| if one exists.
+func (m *ZMap) Get(key *TZval) (value *TZval, ok bool) {
+	keyFixed, hh := ZMapTZvalHash(key)
+	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
+	mk := uint8(hi)
+	size := uint32(len(m.groups))
+	g := uint32((uint64(hi) * uint64(size)) >> 32)
+	for { // inlined find loop
+		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g].flags))
+		matches := swissMetaMatchH2(meta, lo)
+		for matches != 0 {
+			s := swissNextMatch(&matches)
+			if m.ctrl[g].masks[s] == mk {
+				idx := m.groups[g][s]
+				if ZMapTZvalEqual(keyFixed, m.entry[idx].key) {
+					value = m.entry[idx].value
+					// almost entry.value != TZvalUndef, can remove here
+					ok = uintptr(unsafe.Pointer(value)) != _TZvalUndef
+					return
+				}
+			}
+		}
+		// |key| is not in swissGroup |g|,
+		// stop probing if we see an swissEmpty slot
+		matches = swissMetaMatchEmpty(meta)
+		if matches != 0 {
+			ok = false
+			return
+		}
+		g += 1 // linear probing
+		if g >= size {
+			g = 0
+		}
+	}
+}
+
+// Put attempts to insert |key| and |value|
+func (m *ZMap) Put(key *TZval, value *TZval) {
+	keyFixed, hh := ZMapTZvalHash(key)
+	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
+	mk := uint8(hi)
+	size := uint32(len(m.groups))
+	g := uint32((uint64(hi) * uint64(size)) >> 32)
+	for { // inlined find loop
+		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g].flags))
+		matches := swissMetaMatchH2(meta, lo)
+		for matches != 0 {
+			s := swissNextMatch(&matches)
+			if m.ctrl[g].masks[s] == mk {
+				idx := m.groups[g][s]
+				if ZMapTZvalEqual(keyFixed, m.entry[idx].key) {
+					m.entry[idx].key = key
+					m.entry[idx].value = value
+					return
+				}
+			}
+		}
+		// |key| is not in swissGroup |g|,
+		// stop probing if we see an swissEmpty slot
+		matches = swissMetaMatchEmpty(meta)
+		if matches != 0 { // insert
+			s := swissNextMatch(&matches)
+			m.entry = append(m.entry, ZEntry{key: keyFixed, value: value})
+			m.groups[g][s] = uint32(len(m.entry) - 1)
+			m.ctrl[g].flags[s] = lo
+			m.ctrl[g].masks[s] = mk
+			m.resident++
+			return
+		}
+		g += 1 // linear probing
+		if g >= size {
+			g = 0
+		}
+	}
+}
+
+// Count returns the number of elements in the ZMap.
+func (m *ZMap) Count() int {
+	return int(m.resident - m.dead)
+}
+
+func (m *ZMap) GetResident() uint32 {
+	return m.resident
+}
+
+//region ZMap help func
+
+type ZvalFlags struct {
+	U2    uint32
+	Extra uint16
+	Flag  uint8
+	Typ   uint8
+}
+
+type TZval struct {
+	Ptr unsafe.Pointer
+	ZvalFlags
+}
+
+type PZval struct {
+	Ptr unsafe.Pointer
+	ZvalFlags
+}
+
+type Zval struct {
+	TZval
+}
+
+type LZval struct {
+	ZvalFlags
+	Lval int64
+}
+
+type DZval struct {
+	ZvalFlags
+	Dval float64
+}
+
+type _Zval struct {
+	ZvalFlags
+	Val uintptr
+}
+
+type _TLong struct {
+	U2 int32
+	S2 int16
+	C2 int8
+	C1 int8
+}
+
+type _SLong struct {
+	U2 int32
+	S2 int16
+	S1 int16
+}
+
+type ZString struct {
+	Bytes []byte
+	H     uintptr
+}
+
+type _ZString struct {
+	sliceStruct
+	H uintptr
+}
+
+type sliceStruct struct {
+	Ptr unsafe.Pointer
+	Len int
+	Cap int
+}
+
+func TZvalLong(l int64) *TZval {
+	if l&Int56Test == 0 || l&Int56Test == Int56Test {
+		(*ZvalFlags)(unsafe.Pointer(&l)).Typ = T_LONG
+		//goland:noinspection GoVetUnsafePointer
+		return (*TZval)(unsafe.Pointer(uintptr(l)))
+	}
+	zp := new(LZval)
+	zp.Typ = U_LONG
+	zp.Lval = l
+	return (*TZval)(unsafe.Pointer(zp))
+}
+
+func TZvalStr(s string) *TZval {
+	b := []byte(s)
+	return TZvalBytes(b)
+}
+
+func TZvalBytes(b []byte) *TZval {
+	l := len(b)
+	if l <= 7 {
+		ptr := uintptr(l)<<60 | _TZvalEmptyString
+		i := *(*uintptr)((*sliceStruct)(unsafe.Pointer(&b)).Ptr)
+		//goland:noinspection GoVetUnsafePointer
+		return (*TZval)(unsafe.Pointer(i&TStringMasks[l] | ptr))
+	}
+	zp := new(TZval)
+	zp.Ptr = unsafe.Pointer(&ZString{Bytes: b})
+	zp.Typ = IS_STRING
+	return zp
+}
+
+func (zp *TZval) TZLong_() int64 {
+	tpy := (*ZvalFlags)(unsafe.Pointer(&zp)).Typ
+	if tpy == T_LONG {
+		l := int64(uintptr(unsafe.Pointer(zp)))
+		(*_SLong)(unsafe.Pointer(&l)).S1 = int16((*_TLong)(unsafe.Pointer(&l)).C2)
+		return l
+	}
+	return (*LZval)(unsafe.Pointer(zp)).Lval
+}
+
+var (
+	PtrHashFunc func(uintptr) uintptr
+	StrHashFunc func(string) uintptr
+
+	//goland:noinspection GoSnakeCaseUsage
+	TStringMasks = [8]uintptr{
+		0x0000_0000_0000_0000,
+		0x0000_0000_0000_00ff,
+		0x0000_0000_0000_ffff,
+		0x0000_0000_00ff_ffff,
+		0x0000_0000_ffff_ffff,
+		0x0000_00ff_ffff_ffff,
+		0x0000_ffff_ffff_ffff,
+		0x00ff_ffff_ffff_ffff,
+	}
+)
+
+//goland:noinspection GoSnakeCaseUsage,GoUnusedConst
+const (
+	/* regular data types */
+
+	IS_UNDEF uint8 = 0b0000_0000 // tagged 0b0000
+
+	IS_ARRAY  uint8 = 0b0000_0001 // 0b0001
+	IS_NULL   uint8 = 0b0000_0010 // tagged 0b0010
+	IS_OBJECT uint8 = 0b0000_0011 // 0b0011
+	IS_LONG   uint8 = 0b0000_0100 // tagged 0b0100
+
+	// IS_CONSTANT_AST /* constant expressions */
+	IS_CONSTANT_AST uint8 = 0b0000_0101 // 0b0101
+
+	IS_STRING    uint8 = 0b0000_0110 // tagged 0b0110
+	IS_REFERENCE uint8 = 0b0000_0111 // 0b0111
+	IS_FALSE     uint8 = 0b0000_1000 // tagged 0b1000
+	IS_RESOURCE  uint8 = 0b0000_1001 // 0b1001
+	IS_TRUE      uint8 = 0b0000_1010 // tagged 0b1010
+
+	IS_PTR uint8 = 0b0000_1011 // 0b1011
+	/* internal types */
+
+	IS_DOUBLE uint8 = 0b0000_1100 // tagged 0b1100
+
+	IS_INDIRECT uint8 = 0b0000_1101 // 0b1101
+
+	_IS_ERROR uint8 = 0b0000_1110 // tagged 0b1110
+
+	IS_ALIAS_PTR uint8 = 0b0000_1111 // 0b1111
+
+	/* fake types used only for type hinting (Z_TYPE(zv) can not use them) */
+
+	_IS_BOOL    uint8 = 0b0001_0000 // 0b0001_0000
+	IS_CALLABLE uint8 = 0b0001_0001 // 0b0001_0001
+	IS_ITERABLE uint8 = 0b0001_0010 // 0b0001_0010
+	IS_VOID     uint8 = 0b0001_0011 // 0b0001_0011
+	_IS_NUMBER  uint8 = 0b0001_0100 // 0b0001_0100
+)
+
+//goland:noinspection GoSnakeCaseUsage,GoUnusedConst
+const (
+	/* Tagged Pointer *Zval */
+
+	T_TMASK uint8 = 0b0000_1110
+	T_UMASK uint8 = 0b1000_1110
+	T_PMASK uint8 = 0b0000_0001
+
+	T_LMASK uint8 = 0b0111_0000 // for T_STRING Len 0-7
+
+	T_MASK uint8 = 0b1000_0000
+	U_MASK uint8 = 0b0000_0000
+
+	T_UNDEF  = IS_UNDEF | T_MASK
+	T_NULL   = IS_NULL | T_MASK
+	T_FALSE  = IS_FALSE | T_MASK
+	T_TRUE   = IS_TRUE | T_MASK
+	T_ERROR  = _IS_ERROR | T_MASK
+	T_STRING = IS_STRING | T_MASK
+	T_LONG   = IS_LONG | T_MASK
+
+	/* Union Ptr in Zval */
+
+	U_LONG   = IS_LONG | U_MASK
+	U_DOUBLE = IS_DOUBLE | U_MASK
+
+	T_PACKET_MASK   uintptr = 0x0100_0000_0000_0000
+	T_UNPACKET_MASK uintptr = 0xfeff_ffff_ffff_ffff
+
+	Z_LONG_MAX uintptr = 9223372036854775807
+
+	T_STRING_MASK uintptr = 0x00ff_ffff_ffff_ffff
+	// T_CLOBBERDEADPTR uint8 = 0b1101_1110 //  deaddeaddeade000
+)
+
+/* short integer max and min */
+
+//goland:noinspection GoSnakeCaseUsage,GoUnusedConst
+const (
+	Int56Max  int64 = 36028797018963967  // 0 => 0x007f_ffff_ffff_ffff
+	Int56Min  int64 = -36028797018963968 // -1 (0xffff_ffff_ffff_ffff) => 0xff80_0000_0000_0000
+	Int56Test int64 = -36028797018963968 // 0xff80_0000_0000_0000
+)
+
+//goland:noinspection GoSnakeCaseUsage,GoUnusedConst
+const (
+	_TZvalUndef       = uintptr(T_UNDEF) << 56
+	_TZvalNull        = uintptr(T_NULL) << 56
+	_TZvalFalse       = uintptr(T_FALSE) << 56
+	_TZvalTrue        = uintptr(T_TRUE) << 56
+	_TZvalEmptyString = uintptr(T_STRING) << 56
+
+	_TZvalZero = uintptr(T_LONG) << 56
+	_TZvalOne  = uintptr(T_LONG)<<56 | 1
+
+	_TZvalError = uintptr(T_ERROR) << 56
+)
+
+func init() {
+	strHasher := NewHasher[string]()
+	StrHashFunc = strHasher.Hash
+
+	ptrHasher := NewHasher[uintptr]()
+	PtrHashFunc = ptrHasher.Hash
+}
+
+// ZMapTZvalEqual test *TZval Equal, fast path, it is as well to inline
+func ZMapTZvalEqual(zp1 *TZval, zp2 *TZval) bool {
+	tpy1 := (*ZvalFlags)(unsafe.Pointer(&zp1)).Typ
+	tpy2 := (*ZvalFlags)(unsafe.Pointer(&zp2)).Typ
+
+	// if one is tagged, the other almost is tagged, just test uintptr(zp1) == uintptr(zp2)
+	if tpy1 > 127 || tpy2 > 127 {
+		return uintptr(unsafe.Pointer(zp1)) == uintptr(unsafe.Pointer(zp2))
+	}
+
+	// test Zval for U_LONG or U_DOUBLE
+	tpy1 = (*_Zval)(unsafe.Pointer(zp1)).Typ
+	tpy2 = (*_Zval)(unsafe.Pointer(zp2)).Typ
+
+	// Zval type, test Typ and Val field as uintptr
+	if tpy1 > 0 || tpy2 > 0 { // U_LONG or U_DOUBLE
+		return tpy1 == tpy2 && (*_Zval)(unsafe.Pointer(zp1)).Val == (*_Zval)(unsafe.Pointer(zp2)).Val
+	}
+
+	// test PZval must have ptr and cannot been tagged
+	tpy1 = zp1.Typ
+	tpy2 = zp2.Typ
+
+	// long str and both has hash(str) in H field
+	if tpy1 == IS_STRING && tpy2 == IS_STRING {
+		if (*_ZString)(zp1.Ptr).Len != (*_ZString)(zp2.Ptr).Len {
+			return false
+		}
+		if (*_ZString)(zp1.Ptr).H != (*_ZString)(zp2.Ptr).H {
+			return false
+		}
+		return *(*string)(zp1.Ptr) == *(*string)(zp2.Ptr)
+	}
+
+	// other PZval type, test Typ and Ptr field
+	return tpy1 == tpy2 && uintptr(zp1.Ptr) == uintptr(zp2.Ptr)
+}
+
+// ZMapTZvalHash hash(*TZval) and try to be tagged, it is as well to inline
+func ZMapTZvalHash(zp *TZval) (*TZval, uintptr) {
+	// test TZval tagged, use tagged and hash(tagged)
+	tpy := (*ZvalFlags)(unsafe.Pointer(&zp)).Typ
+	if tpy > 127 {
+		return zp, PtrHashFunc(uintptr(unsafe.Pointer(zp)))
+	}
+
+	// test Zval for U_LONG or U_DOUBLE
+	tpy = (*_Zval)(unsafe.Pointer(zp)).Typ
+	if tpy > 0 { // U_LONG or U_DOUBLE
+		// try tagged U_LONG val
+		if tpy == IS_LONG {
+			l := (*LZval)(unsafe.Pointer(zp)).Lval
+			// short U_LONG use tagged and hash(tagged)
+			if l&Int56Test == 0 || l&Int56Test == Int56Test {
+				(*ZvalFlags)(unsafe.Pointer(&l)).Typ = T_LONG
+				//goland:noinspection GoVetUnsafePointer
+				tagged := (*TZval)(unsafe.Pointer(uintptr(l)))
+				return tagged, PtrHashFunc(uintptr(unsafe.Pointer(tagged)))
+			}
+		}
+		// U_LONG or U_DOUBLE as uintptr val, use ptr and hash(val)
+		return zp, PtrHashFunc((*_Zval)(unsafe.Pointer(zp)).Val)
+	}
+
+	// test PZval ptr val
+	tpy = zp.Typ
+
+	if tpy == IS_STRING {
+		l := (*_ZString)(zp.Ptr).Len
+		h := (*_ZString)(zp.Ptr).H
+
+		// l <= 7 short str use tagged and hash(tagged)
+		if l <= 7 {
+			if h != 0 {
+				//goland:noinspection GoVetUnsafePointer
+				return (*TZval)(unsafe.Pointer(h)), PtrHashFunc(h)
+			}
+			ptr := uintptr(l)<<60 | _TZvalEmptyString
+			i := *(*uintptr)((*_ZString)(zp.Ptr).Ptr)
+			//goland:noinspection GoVetUnsafePointer
+			tagged := (*TZval)(unsafe.Pointer(i&TStringMasks[l] | ptr))
+			// l <= 7 short str save tagged ptr to H
+			(*_ZString)(zp.Ptr).H = uintptr(unsafe.Pointer(tagged))
+			return tagged, PtrHashFunc(uintptr(unsafe.Pointer(tagged)))
+		}
+
+		// long str use ptr and hash(str)
+		if h != 0 {
+			return zp, h
+		}
+		h = StrHashFunc(*(*string)(zp.Ptr))
+		// long str save hash to H
+		(*_ZString)(zp.Ptr).H = h
+		return zp, h
+	}
+
+	// tagged PZval has no ptr, so use tagged and hash(tagged)
+	if tpy == IS_UNDEF || tpy == IS_NULL || tpy == IS_FALSE || tpy == IS_TRUE || tpy == _IS_ERROR {
+		//goland:noinspection GoVetUnsafePointer
+		tagged := (*TZval)(unsafe.Pointer(uintptr(tpy|T_MASK) << 56))
+		return tagged, PtrHashFunc(uintptr(unsafe.Pointer(tagged)))
+	}
+
+	// other PZval has ptr, use ptr and hash(ptr)
+	return zp, PtrHashFunc(uintptr(zp.Ptr))
+}
+
+//endregion
+
+// swissZGroup is a swissZGroup of 8 key-value pairs
+type swissZGroup [swissGroupSize]uint32
+
+// ZMap is an open-addressing hash map
+// based on Abseil's flat_hash_map.
+type ZMap struct {
+	ctrl         []swissMetadata
+	groups       []swissZGroup
+	entry        []ZEntry
+	resident     uint32
+	dead         uint32
+	limit        uint32
+	appendOffset uint32
+}
+
+type ZEntry struct {
+	key   *TZval
+	value *TZval
+}
+
+// NewZMap constructs a ZMap.
+//
+//goland:noinspection GoUnusedExportedFunction
+func NewZMap(sz uint32) (m *ZMap) {
+	groups := swissNumGroups(sz)
+	m = &ZMap{
+		ctrl:   make([]swissMetadata, groups),
+		groups: make([]swissZGroup, groups), // swissGroupSize 8
+		entry:  make([]ZEntry, 0, swissGroupSize),
+		limit:  groups * swissMaxAvgGroupLoad,
+	}
+	t64 := *(*[]swissMeta128)(unsafe.Pointer(&m.ctrl))
+	for i := range t64 {
+		t64[i].flag = swissEmpty64
+	}
+	return
+}
+
+// swissMetadata is the swissH2 swissMetadata array for a swissGroup.
+// find operations first probe the controls bytes
+// to filter candidates before matching keys
+type swissMetadata struct {
+	flags [swissGroupSize]int8
+	masks [swissGroupSize]uint8
+}
+
+type swissMeta128 struct {
+	flag uint64
+	mask uint64
+}
+
+// swissNumGroups returns the minimum number of groups needed to store |n| elems.
+func swissNumGroups(n uint32) (groups uint32) {
+	groups = (n + swissMaxAvgGroupLoad - 1) / swissMaxAvgGroupLoad
+	if groups == 0 {
+		groups = 1
+	} else if groups >= 128 {
+		groups += groups >> 2
+	}
+	return
+}
+
+// noescape hides a pointer from escape analysis. It is the identity function
+// but escape analysis doesn't think the output depends on the input.
+// noescape is inlined and currently compiles down to zero instructions.
+// USE CAREFULLY!
+// This was copied from the runtime (via pkg "strings"); see issues 23382 and 7921.
+//
+//go:nosplit
+//go:nocheckptr
+func noescape(p unsafe.Pointer) unsafe.Pointer {
+	x := uintptr(p)
+	//goland:noinspection GoVetUnsafePointer
+	return unsafe.Pointer(x ^ 0)
+}
+
+type mapiface struct {
+	typ *maptype
+	val *hmap
+}
+
+// go/src/runtime/type.go
+type maptype struct {
+	typ    _type
+	key    *_type
+	elem   *_type
+	bucket *_type
+	// function for hashing keys (ptr to key, seed) -> hash
+	hasher     func(unsafe.Pointer, uintptr) uintptr
+	keysize    uint8
+	elemsize   uint8
+	bucketsize uint16
+	flags      uint32
+}
+
+// go/src/runtime/map.go
+type hmap struct {
+	count     int
+	flags     uint8
+	B         uint8
+	noverflow uint16
+	// hash seed
+	hash0      uint32
+	buckets    unsafe.Pointer
+	oldbuckets unsafe.Pointer
+	nevacuate  uintptr
+	// true type is *mapextra,
+	// but we don't need this data
+	extra unsafe.Pointer
+}
+
+// go/src/runtime/type.go
+type tflag uint8
+type nameOff int32
+type typeOff int32
+
+// go/src/runtime/type.go
+type _type struct {
+	size       uintptr
+	ptrdata    uintptr
+	hash       uint32
+	tflag      tflag
+	align      uint8
+	fieldAlign uint8
+	kind       uint8
+	equal      func(unsafe.Pointer, unsafe.Pointer) bool
+	gcdata     *byte
+	str        nameOff
+	ptrToThis  typeOff
+}
 
 const (
 	swissGroupSize       = 8
@@ -12,8 +582,6 @@ const (
 	swissLoBits uint64 = 0x0101010101010101
 	swissHiBits uint64 = 0x8080808080808080
 )
-
-type swissBitset uint64
 
 type hashfn func(unsafe.Pointer, uintptr) uintptr
 
@@ -30,28 +598,12 @@ func NewHasher[K comparable]() Hasher[K] {
 	return Hasher[K]{hash: h, seed: ss}
 }
 
-// NewSeed returns a copy of |h| with a new hash seed.
-func NewSeed[K comparable](h Hasher[K]) Hasher[K] {
-	return Hasher[K]{
-		hash: h.hash,
-		seed: uintptr(fastrand64()),
-	}
-}
-
 // Hash hashes |key|.
 func (h Hasher[K]) Hash(key K) uintptr {
 	// promise to the compiler that pointer
 	// |p| does not escape the stack.
 	p := noescape(unsafe.Pointer(&key))
 	return h.hash(p, h.seed)
-}
-
-// Hash64 hashes |key|.
-func (h Hasher[K]) Hash64(key K) uint64 {
-	// promise to the compiler that pointer
-	// |p| does not escape the stack.
-	p := noescape(unsafe.Pointer(&key))
-	return uint64(h.hash(p, h.seed))
 }
 
 func getRuntimeHasher[K comparable]() (h hashfn, seed uintptr) {
@@ -61,23 +613,21 @@ func getRuntimeHasher[K comparable]() (h hashfn, seed uintptr) {
 	return
 }
 
-func swissMetaMatchH2(m *swissMetadata, h swissH2) swissBitset {
+func swissMetaMatchH2(m *uint64, h int8) uint64 {
 	// https://graphics.stanford.edu/~seander/bithacks.html##ValueInWord
-	return swissHasZeroByte(*(*uint64)((unsafe.Pointer)(m)) ^ (swissLoBits * uint64(h)))
+	x := *m ^ (swissLoBits * uint64(h))
+	return ((x - swissLoBits) & ^(x)) & swissHiBits
 }
 
-func swissMetaMatchEmpty(m *swissMetadata) swissBitset {
-	return swissHasZeroByte(*(*uint64)((unsafe.Pointer)(m)) ^ swissHiBits)
+func swissMetaMatchEmpty(m *uint64) uint64 {
+	x := *m ^ swissHiBits
+	return ((x - swissLoBits) & ^(x)) & swissHiBits
 }
 
-func swissNextMatch(b *swissBitset) uint32 {
-	s := uint32(bits.TrailingZeros64(uint64(*b)))
+func swissNextMatch(b *uint64) uint32 {
+	s := uint32(bits.TrailingZeros64(*b))
 	*b &= ^(1 << s) // clear bit |s|
 	return s >> 3   // div by 8
-}
-
-func swissHasZeroByte(x uint64) swissBitset {
-	return swissBitset(((x - swissLoBits) & ^(x)) & swissHiBits)
 }
 
 //goland:noinspection GoUnusedConst
@@ -85,327 +635,8 @@ const (
 	swissMaxLoadFactor = float32(swissMaxAvgGroupLoad) / float32(swissGroupSize)
 )
 
-// SwissMap is an open-addressing hash map
-// based on Abseil's flat_hash_map.
-type SwissMap[K comparable, V any] struct {
-	ctrl     []swissMetadata
-	groups   []swissGroup[K, V]
-	hash     Hasher[K]
-	resident uint32
-	dead     uint32
-	limit    uint32
-}
-
-// swissMetadata is the swissH2 swissMetadata array for a swissGroup.
-// find operations first probe the controls bytes
-// to filter candidates before matching keys
-type swissMetadata [swissGroupSize]int8
-
-// swissGroup is a swissGroup of 16 key-value pairs
-type swissGroup[K comparable, V any] struct {
-	keys   [swissGroupSize]K
-	values [swissGroupSize]V
-}
-
 const (
-	swissH1Mask    uint64 = 0xffff_ffff_ffff_ff80
-	swissH2Mask    uint64 = 0x0000_0000_0000_007f
-	swissEmpty     int8   = -128 // 0b1000_0000
-	swissTombstone int8   = -2   // 0b1111_1110
+	swissH1Mask  uintptr = 0xffff_ffff_ffff_ff80
+	swissH2Mask  uintptr = 0x0000_0000_0000_007f
+	swissEmpty64 uint64  = 0x8080_8080_8080_8080 // 0b1000_0000
 )
-
-// swissH1 is a 57 bit hash prefix
-type swissH1 uint64
-
-// swissH2 is a 7 bit hash suffix
-type swissH2 int8
-
-// NewSwissMap constructs a SwissMap.
-//
-//goland:noinspection GoUnusedExportedFunction
-func NewSwissMap[K comparable, V any](sz uint32) (m *SwissMap[K, V]) {
-	groups := swissNumGroups(sz)
-	m = &SwissMap[K, V]{
-		ctrl:   make([]swissMetadata, groups),
-		groups: make([]swissGroup[K, V], groups),
-		hash:   NewHasher[K](),
-		limit:  groups * swissMaxAvgGroupLoad,
-	}
-	for i := range m.ctrl {
-		m.ctrl[i] = swissNewEmptyMetadata()
-	}
-	return
-}
-
-// Has returns true if |key| is present in |m|.
-func (m *SwissMap[K, V]) Has(key K) (ok bool) {
-	hi, lo := swissSplitHash(m.hash.Hash64(key))
-	g := swissProbeStart(hi, len(m.groups))
-	for { // inlined find loop
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
-		for matches != 0 {
-			s := swissNextMatch(&matches)
-			if key == m.groups[g].keys[s] {
-				ok = true
-				return
-			}
-		}
-		// |key| is not in swissGroup |g|,
-		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
-		if matches != 0 {
-			ok = false
-			return
-		}
-		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
-			g = 0
-		}
-	}
-}
-
-// Get returns the |value| mapped by |key| if one exists.
-func (m *SwissMap[K, V]) Get(key K) (value V, ok bool) {
-	hi, lo := swissSplitHash(m.hash.Hash64(key))
-	g := swissProbeStart(hi, len(m.groups))
-	for { // inlined find loop
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
-		for matches != 0 {
-			s := swissNextMatch(&matches)
-			if key == m.groups[g].keys[s] {
-				value, ok = m.groups[g].values[s], true
-				return
-			}
-		}
-		// |key| is not in swissGroup |g|,
-		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
-		if matches != 0 {
-			ok = false
-			return
-		}
-		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
-			g = 0
-		}
-	}
-}
-
-// Put attempts to insert |key| and |value|
-func (m *SwissMap[K, V]) Put(key K, value V) {
-	if m.resident >= m.limit {
-		m.rehash(m.nextSize())
-	}
-	hi, lo := swissSplitHash(m.hash.Hash64(key))
-	g := swissProbeStart(hi, len(m.groups))
-	for { // inlined find loop
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
-		for matches != 0 {
-			s := swissNextMatch(&matches)
-			if key == m.groups[g].keys[s] { // update
-				m.groups[g].keys[s] = key
-				m.groups[g].values[s] = value
-				return
-			}
-		}
-		// |key| is not in swissGroup |g|,
-		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
-		if matches != 0 { // insert
-			s := swissNextMatch(&matches)
-			m.groups[g].keys[s] = key
-			m.groups[g].values[s] = value
-			m.ctrl[g][s] = int8(lo)
-			m.resident++
-			return
-		}
-		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
-			g = 0
-		}
-	}
-}
-
-// Delete attempts to remove |key|, returns true successful.
-func (m *SwissMap[K, V]) Delete(key K) (ok bool) {
-	hi, lo := swissSplitHash(m.hash.Hash64(key))
-	g := swissProbeStart(hi, len(m.groups))
-	for {
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
-		for matches != 0 {
-			s := swissNextMatch(&matches)
-			if key == m.groups[g].keys[s] {
-				ok = true
-				// optimization: if |m.ctrl[g]| contains any swissEmpty
-				// swissMetadata bytes, we can physically delete |key|
-				// rather than placing a swissTombstone.
-				// The observation is that any probes into swissGroup |g|
-				// would already be terminated by the existing swissEmpty
-				// slot, and therefore reclaiming slot |s| will not
-				// cause premature termination of probes into |g|.
-				if swissMetaMatchEmpty(&m.ctrl[g]) != 0 {
-					m.ctrl[g][s] = swissEmpty
-					m.resident--
-				} else {
-					m.ctrl[g][s] = swissTombstone
-					m.dead++
-				}
-				return
-			}
-		}
-		// |key| is not in swissGroup |g|,
-		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
-		if matches != 0 { // |key| absent
-			ok = false
-			return
-		}
-		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
-			g = 0
-		}
-	}
-}
-
-// Iter iterates the elements of the SwissMap, passing them to the callback.
-// It guarantees that any key in the SwissMap will be visited only once, and
-// for un-mutated Maps, every key will be visited once. If the SwissMap is
-// Mutated during iteration, mutations will be reflected on return from
-// Iter, but the set of keys visited by Iter is non-deterministic.
-func (m *SwissMap[K, V]) Iter(cb func(k K, v V) (stop bool)) {
-	// take a consistent view of the table in case
-	// we rehash during iteration
-	ctrl, groups := m.ctrl, m.groups
-	// pick a random starting swissGroup
-	g := swissRandIntN(len(groups))
-	for n := 0; n < len(groups); n++ {
-		for s, c := range ctrl[g] {
-			if c == swissEmpty || c == swissTombstone {
-				continue
-			}
-			k, v := groups[g].keys[s], groups[g].values[s]
-			if stop := cb(k, v); stop {
-				return
-			}
-		}
-		g++
-		if g >= uint32(len(groups)) {
-			g = 0
-		}
-	}
-}
-
-// Clear removes all elements from the SwissMap.
-func (m *SwissMap[K, V]) Clear() {
-	for i, c := range m.ctrl {
-		for j := range c {
-			m.ctrl[i][j] = swissEmpty
-		}
-	}
-	m.resident, m.dead = 0, 0
-}
-
-// Count returns the number of elements in the SwissMap.
-func (m *SwissMap[K, V]) Count() int {
-	return int(m.resident - m.dead)
-}
-
-// Capacity returns the number of additional elements
-// they can be added to the SwissMap before resizing.
-func (m *SwissMap[K, V]) Capacity() int {
-	return int(m.limit - m.resident)
-}
-
-// find returns the location of |key| if present, or its insertion location if absent.
-// for performance, find is manually inlined into public methods.
-func (m *SwissMap[K, V]) find(key K, hi swissH1, lo swissH2) (g, s uint32, ok bool) {
-	g = swissProbeStart(hi, len(m.groups))
-	for {
-		matches := swissMetaMatchH2(&m.ctrl[g], lo)
-		for matches != 0 {
-			s = swissNextMatch(&matches)
-			if key == m.groups[g].keys[s] {
-				return g, s, true
-			}
-		}
-		// |key| is not in swissGroup |g|,
-		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(&m.ctrl[g])
-		if matches != 0 {
-			s = swissNextMatch(&matches)
-			return g, s, false
-		}
-		g += 1 // linear probing
-		if g >= uint32(len(m.groups)) {
-			g = 0
-		}
-	}
-}
-
-func (m *SwissMap[K, V]) nextSize() (n uint32) {
-	n = uint32(len(m.groups)) * 2
-	if m.dead >= (m.resident / 2) {
-		n = uint32(len(m.groups))
-	}
-	return
-}
-
-func (m *SwissMap[K, V]) rehash(n uint32) {
-	groups, ctrl := m.groups, m.ctrl
-	m.groups = make([]swissGroup[K, V], n)
-	m.ctrl = make([]swissMetadata, n)
-	for i := range m.ctrl {
-		m.ctrl[i] = swissNewEmptyMetadata()
-	}
-	m.hash = NewSeed(m.hash)
-	m.limit = n * swissMaxAvgGroupLoad
-	m.resident, m.dead = 0, 0
-	for g := range ctrl {
-		for s := range ctrl[g] {
-			c := ctrl[g][s]
-			if c == swissEmpty || c == swissTombstone {
-				continue
-			}
-			m.Put(groups[g].keys[s], groups[g].values[s])
-		}
-	}
-}
-
-func (m *SwissMap[K, V]) loadFactor() float32 {
-	slots := float32(len(m.groups) * swissGroupSize)
-	return float32(m.resident-m.dead) / slots
-}
-
-// swissNumGroups returns the minimum number of groups needed to store |n| elems.
-func swissNumGroups(n uint32) (groups uint32) {
-	groups = (n + swissMaxAvgGroupLoad - 1) / swissMaxAvgGroupLoad
-	if groups == 0 {
-		groups = 1
-	}
-	return
-}
-
-func swissNewEmptyMetadata() (meta swissMetadata) {
-	for i := range meta {
-		meta[i] = swissEmpty
-	}
-	return
-}
-
-func swissSplitHash(h uint64) (swissH1, swissH2) {
-	return swissH1((h & swissH1Mask) >> 7), swissH2(h & swissH2Mask)
-}
-
-func swissProbeStart(hi swissH1, groups int) uint32 {
-	return swissFastModN(uint32(hi), uint32(groups))
-}
-
-// lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
-func swissFastModN(x, n uint32) uint32 {
-	return uint32((uint64(x) * uint64(n)) >> 32)
-}
-
-// swissRandIntN returns a random number in the interval [0, n).
-func swissRandIntN(n int) uint32 {
-	return swissFastModN(fastrand(), uint32(n))
-}
