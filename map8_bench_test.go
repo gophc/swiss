@@ -248,7 +248,7 @@ func BenchmarkStringMaps8(b *testing.B) {
 }
 
 func BenchmarkInt64Maps8(b *testing.B) {
-	sizes := []int{16, 128, 1024, 1024 * 8, 1024 * 64, 1024 * 512, 1024 * 1024 * 4}
+	sizes := []int{128, 1024 * 8, 1024 * 64, 1024 * 512, 1024 * 1024 * 4}
 	for _, n := range sizes {
 		data := generateInt64Data8(n)
 		tdata := zend.Ints2TZvals(data)

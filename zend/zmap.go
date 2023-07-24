@@ -20,17 +20,16 @@ func main() {
 }
 
 // Get returns the |value| mapped by |key| if one exists.
-func (m *ZMap) Get(key *TZval) (value *TZval, ok bool) {
+func (m *ZMap) Get(key *TZval) (*TZval, bool) {
 	keyFixed, hh := ZMapTZvalHash(key)
 	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
 	size := uint32(len(m.groups))
-	g, s, ok := m.ZMapFind(keyFixed, hi, size, lo)
-	if ok {
-		idx := m.groups[g][s]
-		value = m.entry[idx].value
-		return
+	idx, _, _ := m.ZMapFind(keyFixed, hi, size, lo)
+	if idx >= 0 {
+		return m.entry[idx].value, true
 	}
-	return
+	//goland:noinspection GoVetUnsafePointer
+	return (*TZval)(unsafe.Pointer(_TZvalUndef)), false
 }
 
 // Put attempts to insert |key| and |value|
@@ -38,10 +37,8 @@ func (m *ZMap) Put(key *TZval, value *TZval) {
 	keyFixed, hh := ZMapTZvalHash(key)
 	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
 	size := uint32(len(m.groups))
-	g, s, ok := m.ZMapFind(keyFixed, hi, size, lo)
-	if ok {
-		idx := m.groups[g][s]
-
+	idx, g, s := m.ZMapFind(keyFixed, hi, size, lo)
+	if idx >= 0 {
 		m.entry[idx].key = key
 		m.entry[idx].value = value
 		return
@@ -55,17 +52,79 @@ func (m *ZMap) Put(key *TZval, value *TZval) {
 	return
 }
 
-func (m *ZMap) ZMapFind(key *TZval, hi uint32, size uint32, lo int8) (g, s uint32, ok bool) {
-	g = uint32((uint64(hi) * uint64(size)) >> 32)
+//go:nosplit
+func (m *ZMap) ZMapFind(zp1 *TZval, hi uint32, size uint32, lo int8) (int, uint32, uint32) {
+	g := uint32((uint64(hi) * uint64(size)) >> 32)
 	for {
-		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g].flags))
+		// meta := (*uint64)(unsafe.Pointer(&m.ctrl[g].flags))
+		//goland:noinspection GoVetUnsafePointer
+		meta := (*uint64)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).ctrlPtr + uintptr(g<<4)))
 		matches := swissMetaMatchH2(meta, lo)
 		for matches != 0 {
-			s = swissNextMatch(&matches)
-			if m.ctrl[g].masks[s] == uint8(hi) {
-				idx := m.groups[g][s]
-				if ZMapTZvalEqual(key, m.entry[idx].key) {
-					return g, s, true
+			s := swissNextMatch(&matches)
+			if *(*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(meta)) + uintptr(s+8))) == uint8(hi) {
+				// idx := m.groups[g][s]
+				//goland:noinspection GoVetUnsafePointer
+				idx := int(*(*uint32)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).groupsPtr + uintptr(g<<5+s<<2))))
+				// zp2 := m.entry[idx].key
+				//goland:noinspection GoVetUnsafePointer
+				zp2 := *(**TZval)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).entryPtr + uintptr(idx<<4)))
+				// if ZMapTZvalEqual(zp1, zp2) { return idx, g, s }
+
+				//region ZMapTZvalEqual inline
+				zMapTZvalEqual := false
+				for {
+					if uintptr(unsafe.Pointer(zp1)) == uintptr(unsafe.Pointer(zp2)) {
+						zMapTZvalEqual = true
+						break
+					}
+
+					tpy1 := (*ZvalFlags)(unsafe.Pointer(&zp1)).Typ
+					tpy2 := (*ZvalFlags)(unsafe.Pointer(&zp2)).Typ
+
+					// if one is tagged, the other almost is tagged, just test uintptr(zp1) == uintptr(zp2)
+					if tpy1 > 127 || tpy2 > 127 {
+						zMapTZvalEqual = false
+						break
+					}
+
+					// test Zval for U_LONG or U_DOUBLE
+					tpy1 = (*_Zval)(unsafe.Pointer(zp1)).Typ
+					tpy2 = (*_Zval)(unsafe.Pointer(zp2)).Typ
+
+					// Zval type, test Typ and Val field as uintptr
+					if tpy1 > 0 || tpy2 > 0 { // U_LONG or U_DOUBLE
+						zMapTZvalEqual = tpy1 == tpy2 &&
+							(*_Zval)(unsafe.Pointer(zp1)).Val == (*_Zval)(unsafe.Pointer(zp2)).Val
+						break
+					}
+
+					// test PZval must have ptr and cannot been tagged
+					tpy1 = zp1.Typ
+					tpy2 = zp2.Typ
+
+					// long str and both has hash(str) in H field
+					if tpy1 == IS_STRING && tpy2 == IS_STRING {
+						if (*_ZString)(zp1.Ptr).Len != (*_ZString)(zp2.Ptr).Len {
+							zMapTZvalEqual = false
+							break
+						}
+						if (*_ZString)(zp1.Ptr).H != (*_ZString)(zp2.Ptr).H {
+							zMapTZvalEqual = false
+							break
+						}
+						zMapTZvalEqual = *(*string)(zp1.Ptr) == *(*string)(zp2.Ptr)
+						break
+					}
+
+					// other PZval type, test Typ and Ptr field
+					zMapTZvalEqual = tpy1 == tpy2 && uintptr(zp1.Ptr) == uintptr(zp2.Ptr)
+					break
+				}
+				//endregion
+
+				if zMapTZvalEqual {
+					return idx, g, s
 				}
 			}
 		}
@@ -73,8 +132,8 @@ func (m *ZMap) ZMapFind(key *TZval, hi uint32, size uint32, lo int8) (g, s uint3
 		// stop probing if we see an swissEmpty slot
 		matches = swissMetaMatchEmpty(meta)
 		if matches != 0 {
-			s = swissNextMatch(&matches)
-			return g, s, false
+			s := swissNextMatch(&matches)
+			return -1, g, s
 		}
 		g += 1 // linear probing
 		if g >= size {
@@ -340,6 +399,8 @@ func init() {
 }
 
 // ZMapTZvalEqual test *TZval Equal, fast path, it is as well to inline
+//
+//goland:noinspection GoUnusedExportedFunction
 func ZMapTZvalEqual(zp1 *TZval, zp2 *TZval) bool {
 	if uintptr(unsafe.Pointer(zp1)) == uintptr(unsafe.Pointer(zp2)) {
 		return true
@@ -461,6 +522,25 @@ type ZMap struct {
 	ctrl         []swissMetadata
 	groups       []swissZGroup
 	entry        []ZEntry
+	resident     uint32
+	dead         uint32
+	limit        uint32
+	appendOffset uint32
+}
+
+type ZMapStruct struct {
+	ctrlPtr uintptr
+	ctrlLen int
+	ctrlCap int
+
+	groupsPtr uintptr
+	groupsLen int
+	groupsCap int
+
+	entryPtr uintptr
+	entryLen int
+	entryCap int
+
 	resident     uint32
 	dead         uint32
 	limit        uint32
