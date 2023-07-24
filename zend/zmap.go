@@ -23,21 +23,49 @@ func main() {
 func (m *ZMap) Get(key *TZval) (value *TZval, ok bool) {
 	keyFixed, hh := ZMapTZvalHash(key)
 	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
-	mk := uint8(hi)
 	size := uint32(len(m.groups))
-	g := uint32((uint64(hi) * uint64(size)) >> 32)
-	for { // inlined find loop
+	g, s, ok := m.ZMapFind(keyFixed, hi, size, lo)
+	if ok {
+		idx := m.groups[g][s]
+		value = m.entry[idx].value
+		return
+	}
+	return
+}
+
+// Put attempts to insert |key| and |value|
+func (m *ZMap) Put(key *TZval, value *TZval) {
+	keyFixed, hh := ZMapTZvalHash(key)
+	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
+	size := uint32(len(m.groups))
+	g, s, ok := m.ZMapFind(keyFixed, hi, size, lo)
+	if ok {
+		idx := m.groups[g][s]
+
+		m.entry[idx].key = key
+		m.entry[idx].value = value
+		return
+	}
+
+	m.entry = append(m.entry, ZEntry{key: keyFixed, value: value})
+	m.groups[g][s] = uint32(len(m.entry) - 1)
+	m.ctrl[g].flags[s] = lo
+	m.ctrl[g].masks[s] = uint8(hi)
+	m.resident++
+	return
+}
+
+func (m *ZMap) ZMapFind(key *TZval, hi uint32, size uint32, lo int8) (g, s uint32, ok bool) {
+	g = uint32((uint64(hi) * uint64(size)) >> 32)
+	for {
 		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g].flags))
 		matches := swissMetaMatchH2(meta, lo)
 		for matches != 0 {
-			s := swissNextMatch(&matches)
-			if m.ctrl[g].masks[s] == mk {
+			s = swissNextMatch(&matches)
+			if m.ctrl[g].masks[s] == uint8(hi) {
 				idx := m.groups[g][s]
-				if ZMapTZvalEqual(keyFixed, m.entry[idx].key) {
-					value = m.entry[idx].value
-					// almost entry.value != TZvalUndef, can remove here
-					ok = uintptr(unsafe.Pointer(value)) != _TZvalUndef
-					return
+				if ZMapTZvalEqual(key, m.entry[idx].key) {
+					return g, s, true
 				}
 			}
 		}
@@ -45,48 +73,8 @@ func (m *ZMap) Get(key *TZval) (value *TZval, ok bool) {
 		// stop probing if we see an swissEmpty slot
 		matches = swissMetaMatchEmpty(meta)
 		if matches != 0 {
-			ok = false
-			return
-		}
-		g += 1 // linear probing
-		if g >= size {
-			g = 0
-		}
-	}
-}
-
-// Put attempts to insert |key| and |value|
-func (m *ZMap) Put(key *TZval, value *TZval) {
-	keyFixed, hh := ZMapTZvalHash(key)
-	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
-	mk := uint8(hi)
-	size := uint32(len(m.groups))
-	g := uint32((uint64(hi) * uint64(size)) >> 32)
-	for { // inlined find loop
-		meta := (*uint64)(unsafe.Pointer(&m.ctrl[g].flags))
-		matches := swissMetaMatchH2(meta, lo)
-		for matches != 0 {
-			s := swissNextMatch(&matches)
-			if m.ctrl[g].masks[s] == mk {
-				idx := m.groups[g][s]
-				if ZMapTZvalEqual(keyFixed, m.entry[idx].key) {
-					m.entry[idx].key = key
-					m.entry[idx].value = value
-					return
-				}
-			}
-		}
-		// |key| is not in swissGroup |g|,
-		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(meta)
-		if matches != 0 { // insert
-			s := swissNextMatch(&matches)
-			m.entry = append(m.entry, ZEntry{key: keyFixed, value: value})
-			m.groups[g][s] = uint32(len(m.entry) - 1)
-			m.ctrl[g].flags[s] = lo
-			m.ctrl[g].masks[s] = mk
-			m.resident++
-			return
+			s = swissNextMatch(&matches)
+			return g, s, false
 		}
 		g += 1 // linear probing
 		if g >= size {
@@ -105,6 +93,22 @@ func (m *ZMap) GetResident() uint32 {
 }
 
 //region ZMap help func
+
+func Strs2TZvals(strs []string) []*TZval {
+	zps := make([]*TZval, 0, len(strs))
+	for _, s := range strs {
+		zps = append(zps, TZvalStr(s))
+	}
+	return zps
+}
+
+func Ints2TZvals(ints []int64) []*TZval {
+	zps := make([]*TZval, 0, len(ints))
+	for _, l := range ints {
+		zps = append(zps, TZvalLong(l))
+	}
+	return zps
+}
 
 type ZvalFlags struct {
 	U2    uint32
@@ -337,6 +341,10 @@ func init() {
 
 // ZMapTZvalEqual test *TZval Equal, fast path, it is as well to inline
 func ZMapTZvalEqual(zp1 *TZval, zp2 *TZval) bool {
+	if uintptr(unsafe.Pointer(zp1)) == uintptr(unsafe.Pointer(zp2)) {
+		return true
+	}
+
 	tpy1 := (*ZvalFlags)(unsafe.Pointer(&zp1)).Typ
 	tpy2 := (*ZvalFlags)(unsafe.Pointer(&zp2)).Typ
 
