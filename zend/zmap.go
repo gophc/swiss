@@ -23,10 +23,11 @@ func main() {
 func (m *ZMap) Get(key *TZval) (*TZval, bool) {
 	keyFixed, hh := ZMapTZvalHash(key)
 	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
-	size := uint32(len(m.groups))
+	size := uint32(len(m.ctrl))
 	idx, _, _ := m.ZMapFind(keyFixed, hi, size, lo)
 	if idx >= 0 {
-		return m.entry[idx].value, true
+		//goland:noinspection GoVetUnsafePointer  ==>>  m.entry[idx].value
+		return *(**TZval)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).entryPtr + uintptr(idx<<4+8))), true
 	}
 	//goland:noinspection GoVetUnsafePointer
 	return (*TZval)(unsafe.Pointer(_TZvalUndef)), false
@@ -36,104 +37,102 @@ func (m *ZMap) Get(key *TZval) (*TZval, bool) {
 func (m *ZMap) Put(key *TZval, value *TZval) {
 	keyFixed, hh := ZMapTZvalHash(key)
 	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
-	size := uint32(len(m.groups))
-	idx, g, s := m.ZMapFind(keyFixed, hi, size, lo)
+	size := uint32(len(m.ctrl))
+	idx, meta, s := m.ZMapFind(keyFixed, hi, size, lo)
 	if idx >= 0 {
-		m.entry[idx].key = key
-		m.entry[idx].value = value
+		//goland:noinspection GoVetUnsafePointer  ==>>  m.entry[idx].key
+		*(**TZval)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).entryPtr + uintptr(idx<<4))) = key
+		//goland:noinspection GoVetUnsafePointer  ==>>  m.entry[idx].value
+		*(**TZval)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).entryPtr + uintptr(idx<<4+8))) = value
 		return
 	}
 
+	//goland:noinspection GoVetUnsafePointer  ==>>  m.ctrl[g].flags[s]
+	*(*int8)(unsafe.Pointer(meta + uintptr(s))) = lo
+	//goland:noinspection GoVetUnsafePointer  ==>>  m.ctrl[g].masks[s]
+	*(*uint8)(unsafe.Pointer(meta + uintptr(s+8))) = uint8(hi)
+	//goland:noinspection GoVetUnsafePointer  ==>>  m.ctrl[g].groups[s]
+	*(*uint32)(unsafe.Pointer(meta + uintptr(s<<2+16))) = uint32(len(m.entry))
 	m.entry = append(m.entry, ZEntry{key: keyFixed, value: value})
-	m.groups[g][s] = uint32(len(m.entry) - 1)
-	m.ctrl[g].flags[s] = lo
-	m.ctrl[g].masks[s] = uint8(hi)
 	m.resident++
 	return
 }
 
 //go:nosplit
-func (m *ZMap) ZMapFind(zp1 *TZval, hi uint32, size uint32, lo int8) (int, uint32, uint32) {
+func (m *ZMap) ZMapFind(zp1 *TZval, hi uint32, size uint32, lo int8) (int, uintptr, uint32) {
 	g := uint32((uint64(hi) * uint64(size)) >> 32)
 	for {
 		// meta := (*uint64)(unsafe.Pointer(&m.ctrl[g].flags))
+		meta := (*ZMapStruct)(unsafe.Pointer(m)).ctrlPtr + uintptr(g*48)
 		//goland:noinspection GoVetUnsafePointer
-		meta := (*uint64)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).ctrlPtr + uintptr(g<<4)))
-		matches := swissMetaMatchH2(meta, lo)
+		matches := swissMetaMatchH2((*uint64)(unsafe.Pointer(meta)), lo)
 		for matches != 0 {
 			s := swissNextMatch(&matches)
-			if *(*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(meta)) + uintptr(s+8))) == uint8(hi) {
+			//goland:noinspection GoVetUnsafePointer
+			if *(*uint8)(unsafe.Pointer(meta + uintptr(s+8))) == uint8(hi) {
 				// idx := m.groups[g][s]
 				//goland:noinspection GoVetUnsafePointer
-				idx := int(*(*uint32)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).groupsPtr + uintptr(g<<5+s<<2))))
+				idx := int(*(*uint32)(unsafe.Pointer(meta + uintptr(s<<2+16))))
 				// zp2 := m.entry[idx].key
 				//goland:noinspection GoVetUnsafePointer
 				zp2 := *(**TZval)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).entryPtr + uintptr(idx<<4)))
 				// if ZMapTZvalEqual(zp1, zp2) { return idx, g, s }
 
 				//region ZMapTZvalEqual inline
-				zMapTZvalEqual := false
-				for {
-					if uintptr(unsafe.Pointer(zp1)) == uintptr(unsafe.Pointer(zp2)) {
-						zMapTZvalEqual = true
-						break
-					}
+				if uintptr(unsafe.Pointer(zp1)) == uintptr(unsafe.Pointer(zp2)) {
+					// just test uintptr(zp1) == uintptr(zp2)
+					return idx, meta, s
+				}
 
-					tpy1 := (*ZvalFlags)(unsafe.Pointer(&zp1)).Typ
-					tpy2 := (*ZvalFlags)(unsafe.Pointer(&zp2)).Typ
+				tpy1 := (*ZvalFlags)(unsafe.Pointer(&zp1)).Typ
+				tpy2 := (*ZvalFlags)(unsafe.Pointer(&zp2)).Typ
+				if tpy1 > 127 || tpy2 > 127 {
+					// if one is tagged, the other almost is tagged, just not eq here
+					continue
+				}
 
-					// if one is tagged, the other almost is tagged, just test uintptr(zp1) == uintptr(zp2)
-					if tpy1 > 127 || tpy2 > 127 {
-						zMapTZvalEqual = false
-						break
-					}
-
-					// test Zval for U_LONG or U_DOUBLE
-					tpy1 = (*_Zval)(unsafe.Pointer(zp1)).Typ
-					tpy2 = (*_Zval)(unsafe.Pointer(zp2)).Typ
-
+				// test Zval for U_LONG or U_DOUBLE
+				tpy1 = (*_Zval)(unsafe.Pointer(zp1)).Typ
+				tpy2 = (*_Zval)(unsafe.Pointer(zp2)).Typ
+				if tpy1 > 0 || tpy2 > 0 { // U_LONG or U_DOUBLE
 					// Zval type, test Typ and Val field as uintptr
-					if tpy1 > 0 || tpy2 > 0 { // U_LONG or U_DOUBLE
-						zMapTZvalEqual = tpy1 == tpy2 &&
-							(*_Zval)(unsafe.Pointer(zp1)).Val == (*_Zval)(unsafe.Pointer(zp2)).Val
-						break
+					if tpy1 != tpy2 {
+						continue
 					}
-
+					if (*_Zval)(unsafe.Pointer(zp1)).Val == (*_Zval)(unsafe.Pointer(zp2)).Val {
+						return idx, meta, s
+					}
+				} else {
 					// test PZval must have ptr and cannot been tagged
 					tpy1 = zp1.Typ
 					tpy2 = zp2.Typ
-
+					if tpy1 != tpy2 {
+						continue
+					}
 					// long str and both has hash(str) in H field
 					if tpy1 == IS_STRING && tpy2 == IS_STRING {
-						if (*_ZString)(zp1.Ptr).Len != (*_ZString)(zp2.Ptr).Len {
-							zMapTZvalEqual = false
-							break
+						if (*_ZString)(zp1.Ptr).Len != (*_ZString)(zp2.Ptr).Len ||
+							(*_ZString)(zp1.Ptr).H != (*_ZString)(zp2.Ptr).H {
+							continue
 						}
-						if (*_ZString)(zp1.Ptr).H != (*_ZString)(zp2.Ptr).H {
-							zMapTZvalEqual = false
-							break
-						}
-						zMapTZvalEqual = *(*string)(zp1.Ptr) == *(*string)(zp2.Ptr)
-						break
-					}
 
-					// other PZval type, test Typ and Ptr field
-					zMapTZvalEqual = tpy1 == tpy2 && uintptr(zp1.Ptr) == uintptr(zp2.Ptr)
-					break
+						if *(*string)(zp1.Ptr) == *(*string)(zp2.Ptr) {
+							return idx, meta, s
+						}
+					} else if uintptr(zp1.Ptr) == uintptr(zp2.Ptr) { // other PZval type, test Typ and Ptr field
+						return idx, meta, s
+					}
 				}
 				//endregion
-
-				if zMapTZvalEqual {
-					return idx, g, s
-				}
 			}
 		}
 		// |key| is not in swissGroup |g|,
 		// stop probing if we see an swissEmpty slot
-		matches = swissMetaMatchEmpty(meta)
+		//goland:noinspection GoVetUnsafePointer
+		matches = swissMetaMatchEmpty((*uint64)(unsafe.Pointer(meta)))
 		if matches != 0 {
 			s := swissNextMatch(&matches)
-			return -1, g, s
+			return -1, meta, s
 		}
 		g += 1 // linear probing
 		if g >= size {
@@ -513,14 +512,10 @@ func ZMapTZvalHash(zp *TZval) (*TZval, uintptr) {
 
 //endregion
 
-// swissZGroup is a swissZGroup of 8 key-value pairs
-type swissZGroup [swissGroupSize]uint32
-
 // ZMap is an open-addressing hash map
 // based on Abseil's flat_hash_map.
 type ZMap struct {
 	ctrl         []swissMetadata
-	groups       []swissZGroup
 	entry        []ZEntry
 	resident     uint32
 	dead         uint32
@@ -532,10 +527,6 @@ type ZMapStruct struct {
 	ctrlPtr uintptr
 	ctrlLen int
 	ctrlCap int
-
-	groupsPtr uintptr
-	groupsLen int
-	groupsCap int
 
 	entryPtr uintptr
 	entryLen int
@@ -558,10 +549,9 @@ type ZEntry struct {
 func NewZMap(sz uint32) (m *ZMap) {
 	groups := swissNumGroups(sz)
 	m = &ZMap{
-		ctrl:   make([]swissMetadata, groups),
-		groups: make([]swissZGroup, groups), // swissGroupSize 8
-		entry:  make([]ZEntry, 0, swissGroupSize),
-		limit:  groups * swissMaxAvgGroupLoad,
+		ctrl:  make([]swissMetadata, groups),
+		entry: make([]ZEntry, 0, swissGroupSize),
+		limit: groups * swissMaxAvgGroupLoad,
 	}
 	t64 := *(*[]swissMeta128)(unsafe.Pointer(&m.ctrl))
 	for i := range t64 {
@@ -574,13 +564,15 @@ func NewZMap(sz uint32) (m *ZMap) {
 // find operations first probe the controls bytes
 // to filter candidates before matching keys
 type swissMetadata struct {
-	flags [swissGroupSize]int8
-	masks [swissGroupSize]uint8
+	flags  [swissGroupSize]int8
+	masks  [swissGroupSize]uint8
+	groups [swissGroupSize]uint32
 }
 
 type swissMeta128 struct {
 	flag uint64
 	mask uint64
+	_    [swissGroupSize]uint32
 }
 
 // swissNumGroups returns the minimum number of groups needed to store |n| elems.
