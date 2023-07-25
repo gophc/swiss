@@ -40,10 +40,11 @@ func (m *ZMap) Put(key *TZval, value *TZval) {
 	size := uint32(len(m.ctrl))
 	idx, meta, s := m.ZMapFind(keyFixed, hi, size, lo)
 	if idx >= 0 {
+		ptr := (*ZMapStruct)(unsafe.Pointer(m)).entryPtr
 		//goland:noinspection GoVetUnsafePointer  ==>>  m.entry[idx].key
-		*(**TZval)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).entryPtr + uintptr(idx<<4))) = key
+		*(**TZval)(unsafe.Pointer(ptr + uintptr(idx<<4))) = key
 		//goland:noinspection GoVetUnsafePointer  ==>>  m.entry[idx].value
-		*(**TZval)(unsafe.Pointer((*ZMapStruct)(unsafe.Pointer(m)).entryPtr + uintptr(idx<<4+8))) = value
+		*(**TZval)(unsafe.Pointer(ptr + uintptr(idx<<4+8))) = value
 		return
 	}
 
@@ -515,7 +516,7 @@ func ZMapTZvalHash(zp *TZval) (*TZval, uintptr) {
 // ZMap is an open-addressing hash map
 // based on Abseil's flat_hash_map.
 type ZMap struct {
-	ctrl         []swissMetadata
+	ctrl         []swissMetadataI
 	entry        []ZEntry
 	resident     uint32
 	dead         uint32
@@ -549,27 +550,27 @@ type ZEntry struct {
 func NewZMap(sz uint32) (m *ZMap) {
 	groups := swissNumGroups(sz)
 	m = &ZMap{
-		ctrl:  make([]swissMetadata, groups),
+		ctrl:  make([]swissMetadataI, groups),
 		entry: make([]ZEntry, 0, swissGroupSize),
 		limit: groups * swissMaxAvgGroupLoad,
 	}
-	t64 := *(*[]swissMeta128)(unsafe.Pointer(&m.ctrl))
+	t64 := *(*[]swissMeta128I)(unsafe.Pointer(&m.ctrl))
 	for i := range t64 {
 		t64[i].flag = swissEmpty64
 	}
 	return
 }
 
-// swissMetadata is the swissH2 swissMetadata array for a swissGroup.
+// swissMetadataI is the swissH2 swissMetadataI array for a swissGroup.
 // find operations first probe the controls bytes
 // to filter candidates before matching keys
-type swissMetadata struct {
+type swissMetadataI struct {
 	flags  [swissGroupSize]int8
 	masks  [swissGroupSize]uint8
 	groups [swissGroupSize]uint32
 }
 
-type swissMeta128 struct {
+type swissMeta128I struct {
 	flag uint64
 	mask uint64
 	_    [swissGroupSize]uint32
