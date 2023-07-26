@@ -19,6 +19,15 @@ func main() {
 	println(m.Get(TZvalStr("123")))
 }
 
+// Has returns true if |key| is present in |m|.
+func (m *ZMap) Has(key *TZval) bool {
+	keyFixed, hh := ZMapTZvalHash(key)
+	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
+	size := uint32(len(m.ctrl))
+	idx, _, _ := m.ZMapFind(keyFixed, hi, size, lo)
+	return idx >= 0
+}
+
 // Get returns the |value| mapped by |key| if one exists.
 func (m *ZMap) Get(key *TZval) (*TZval, bool) {
 	keyFixed, hh := ZMapTZvalHash(key)
@@ -35,6 +44,16 @@ func (m *ZMap) Get(key *TZval) (*TZval, bool) {
 
 // Put attempts to insert |key| and |value|
 func (m *ZMap) Put(key *TZval, value *TZval) {
+	// map entry.value use TZvalUndef as deleted, not allowed put TZvalUndef
+	if uintptr(unsafe.Pointer(value)) == _TZvalUndef {
+		m.Delete(key)
+		return
+	}
+
+	if m.resident >= m.limit {
+		m.Rehash(m.NextSizeUp())
+	}
+
 	keyFixed, hh := ZMapTZvalHash(key)
 	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
 	size := uint32(len(m.ctrl))
@@ -57,6 +76,86 @@ func (m *ZMap) Put(key *TZval, value *TZval) {
 	m.entry = append(m.entry, ZEntry{key: keyFixed, value: value})
 	m.resident++
 	return
+}
+
+// Delete attempts to remove |key|, returns true successful.
+func (m *ZMap) Delete(key *TZval) bool {
+	if m.dead >= m.limit>>1 {
+		m.Rehash(m.NextSizeDown())
+	}
+
+	keyFixed, hh := ZMapTZvalHash(key)
+	hi, lo := uint32((hh&swissH1Mask)>>7), int8(hh&swissH2Mask)
+	size := uint32(len(m.ctrl))
+	idx, meta, s := m.ZMapFind(keyFixed, hi, size, lo)
+	if idx >= 0 {
+		ptr := (*ZMapStruct)(unsafe.Pointer(m)).entryPtr
+		//goland:noinspection GoVetUnsafePointer  ==>>  m.entry[idx].key
+		*(**TZval)(unsafe.Pointer(ptr + uintptr(idx<<4))) = nil
+		//goland:noinspection GoVetUnsafePointer  ==>>  m.entry[idx].value
+		*(*uintptr)(unsafe.Pointer(ptr + uintptr(idx<<4+8))) = _TZvalUndef
+
+		// optimization: if |m.ctrl[g]| contains any swissEmpty
+		// swissMetadata bytes, we can physically delete |key|
+		// rather than placing a swissTombstone.
+		// The observation is that any probes into swissGroup |g|
+		// would already be terminated by the existing swissEmpty
+		// slot, and therefore reclaiming slot |s| will not
+		// cause premature termination of probes into |g|.
+		//goland:noinspection GoVetUnsafePointer
+		if swissMetaMatchEmpty((*uint64)(unsafe.Pointer(meta))) != 0 {
+			//goland:noinspection GoVetUnsafePointer  ==>>  m.ctrl[g].flags[s]
+			*(*int8)(unsafe.Pointer(meta + uintptr(s))) = swissEmpty
+			m.resident--
+		} else {
+			//goland:noinspection GoVetUnsafePointer  ==>>  m.ctrl[g].flags[s]
+			*(*int8)(unsafe.Pointer(meta + uintptr(s))) = swissTombstone
+			m.dead++
+		}
+		return true
+	}
+	return false
+}
+
+func (m *ZMap) Rehash(n uint32) {
+	entry := m.entry
+	appendOffset := m.appendOffset
+
+	m.limit = n * swissMaxAvgGroupLoad
+	m.resident, m.dead = 0, 0
+	m.appendOffset = 0
+
+	m.entry = make([]ZEntry, 0, m.limit)
+	m.ctrl = make([]swissMetadataI, n)
+	t64 := *(*[]swissMeta128I)(unsafe.Pointer(&m.ctrl))
+	for i := range t64 {
+		t64[i].flag = swissEmpty64
+	}
+
+	for _, zEntry := range entry {
+		if zEntry.key != nil {
+			m.Put(zEntry.key, zEntry.value)
+		} else {
+			appendOffset += 1
+		}
+	}
+	m.appendOffset = appendOffset
+}
+
+func (m *ZMap) NextSizeUp() uint32 {
+	n := uint32(len(m.ctrl) << 1)
+	if n >= 1024 {
+		n -= n >> 2
+	}
+	return n
+}
+
+func (m *ZMap) NextSizeDown() uint32 {
+	n := uint32(len(m.ctrl))
+	if n >= 128 && m.dead*5 >= m.limit<<3 {
+		n -= n >> 1
+	}
+	return n
 }
 
 //go:nosplit
@@ -717,7 +816,9 @@ const (
 )
 
 const (
-	swissH1Mask  uintptr = 0xffff_ffff_ffff_ff80
-	swissH2Mask  uintptr = 0x0000_0000_0000_007f
-	swissEmpty64 uint64  = 0x8080_8080_8080_8080 // 0b1000_0000
+	swissH1Mask    uintptr = 0xffff_ffff_ffff_ff80
+	swissH2Mask    uintptr = 0x0000_0000_0000_007f
+	swissEmpty     int8    = -128                  // 0b1000_0000
+	swissTombstone int8    = -2                    // 0b1111_1110
+	swissEmpty64   uint64  = 0x8080_8080_8080_8080 // 0b1000_0000
 )
