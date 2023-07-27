@@ -1,6 +1,6 @@
 module github.com/dolthub/swiss
 
-go 1.18
+go 1.19
 
 require (
 	github.com/dolthub/maphash v0.1.0
